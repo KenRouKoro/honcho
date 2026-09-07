@@ -4,11 +4,15 @@ Utility for logging traces from LLM calls.
 This module provides structured JSONL logging of LLM inputs/outputs.
 """
 
-import fcntl
 import json
 import time
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # Windows — stdlib fcntl is Unix-only
+    import winfcntl as fcntl
 
 from pydantic import BaseModel
 

@@ -1,8 +1,12 @@
 import asyncio
 import logging
 import os
+import sys
 
-import uvloop
+try:
+    import uvloop
+except ImportError:  # Windows — uvloop is Unix-only
+    uvloop = None
 from prometheus_client import start_http_server
 
 from src.config import settings
@@ -82,7 +86,11 @@ if __name__ == "__main__":
     setup_logging()
     logger.info("Starting deriver queue processor")
 
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    if uvloop is not None:
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    elif sys.platform == "win32":
+        # psycopg async requires SelectorEventLoop on Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         # Start Prometheus metrics server if enabled
         if settings.METRICS.ENABLED:

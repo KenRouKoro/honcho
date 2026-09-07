@@ -200,13 +200,21 @@ class QueueManager:
         """Setup signal handlers, initialize client, and start the main polling loop"""
         logger.debug(f"Initializing QueueManager with {self.workers} workers")
 
-        # Set up signal handlers
+        # Set up signal handlers (add_signal_handler is Unix-only)
         loop = asyncio.get_running_loop()
-        signals = (signal.SIGTERM, signal.SIGINT)
-        for sig in signals:
-            loop.add_signal_handler(
-                sig, lambda s=sig: asyncio.create_task(self.shutdown(s))
-            )
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(
+                    sig, lambda s=sig: asyncio.create_task(self.shutdown(s))
+                )
+            except NotImplementedError:
+                # Windows: fall back to signal.signal + call_soon_threadsafe
+                signal.signal(
+                    sig,
+                    lambda s, _f, sig=sig: loop.call_soon_threadsafe(
+                        lambda sig=sig: asyncio.create_task(self.shutdown(sig))
+                    ),
+                )
         logger.debug("Signal handlers registered")
 
         # Start the reconciler scheduler
@@ -1143,7 +1151,7 @@ async def main():
     try:
         await manager.initialize()
     except Exception as e:
-        logger.error(f"Error in main: {str(e)}")
+        logger.exception("Error in main: %s", e)
         sentry_sdk.capture_exception(e)
     finally:
         await close_cache()

@@ -317,8 +317,12 @@ def append_metrics_to_file(
     if not metrics_file:
         return
 
-    import fcntl
     import time
+
+    try:
+        import fcntl
+    except ImportError:  # Windows — stdlib fcntl is Unix-only
+        import winfcntl as fcntl
 
     # Prepare metrics data
     timestamp = time.time()
