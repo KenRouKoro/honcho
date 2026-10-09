@@ -35,6 +35,7 @@ class CallPurpose(str, Enum):
     DREAM_DEDUCTION = "dream.deduction"
     DREAM_INDUCTION = "dream.induction"
     DREAM_CARD_REFRESH = "dream.card_refresh"
+    DREAM_PROFILE = "dream.profile"
     SUMMARY_SHORT = "summary.short"
     SUMMARY_LONG = "summary.long"
 

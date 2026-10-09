@@ -473,6 +473,55 @@ class RepresentationManager:
         db.expunge_all()
         return list(documents)
 
+    async def get_all_explicit(
+        self, db: AsyncSession, limit: int
+    ) -> tuple[list[models.Document], bool]:
+        """取本 collection 的 explicit 观察，供 profile 压缩用。
+
+        与 ``get_working_representation`` 的两点关键差别：
+
+        1. **不分桶、不做语义筛选**。压缩需要的是"稳定的全集"——读取路径那份三路混合
+           的结果每轮都变（``search_query`` 每轮不同），基于它压缩会每轮失稳、
+           无法被 prompt cache 复用。见 doc/memory_layer_decision.md §19.3。
+        2. **只取 explicit**。deductive/inductive 是 dreamer 的衍生物，下一轮 dream 会重写
+           它们；把它们压进画像等于把不稳定层固化（§19.4：压缩收益全在 explicit 那一层）。
+
+        Args:
+            db: 数据库会话
+            limit: 返回条数上限。超出时返回**最新的** ``limit`` 条（旧的留给上层处理）。
+
+        Returns:
+            ``(documents, truncated)``——documents 按 ``created_at`` **正序**，
+            truncated 表示集合实际多于 ``limit`` 条（本次只覆盖了最近的一段）。
+        """
+        # 多取一条来探测截断，省掉一次 COUNT 查询。
+        stmt = (
+            select(models.Document)
+            .where(
+                models.Document.workspace_name == self.workspace_name,
+                models.Document.observer == self.observer,
+                models.Document.observed == self.observed,
+                models.Document.level == "explicit",
+                models.Document.deleted_at.is_(None),
+            )
+            .order_by(
+                models.Document.created_at.desc(),
+                # created_at 是事务时间戳，同一批写入的观察共用它 —— id 兜底保证确定性。
+                models.Document.id.desc(),
+            )
+            .limit(limit + 1)
+        )
+
+        result = await db.execute(stmt)
+        documents = list(result.scalars().all())
+        db.expunge_all()
+
+        truncated = len(documents) > limit
+        if truncated:
+            documents = documents[:limit]
+        documents.reverse()
+        return documents, truncated
+
     async def _query_documents_most_derived(
         self, db: AsyncSession, top_k: int, session_allowlist: list[str] | None = None
     ) -> list[models.Document]:

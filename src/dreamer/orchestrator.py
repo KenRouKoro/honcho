@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from src import crud, models
 from src.config import settings
 from src.dependencies import tracked_db
+from src.dreamer.profile import compress_profile
 from src.dreamer.specialists import (
     SPECIALISTS,
     CardRefreshSpecialist,
@@ -265,6 +266,29 @@ async def run_dream(
         except Exception as e:
             logger.error(f"[{run_id}] Induction specialist failed: {e}", exc_info=True)
             accumulate_metric(task_name, "induction_error", str(e), "blob")
+
+        # Profile compression (方案 B: 收尾 phase).
+        #
+        # 放在 induction 之后的理由：此刻新的 deductive/inductive 已落库，压缩输入最完整；
+        # 且前面那道 pre-flight skip（新增 explicit < DOCUMENT_THRESHOLD 就整轮 return None）
+        # 自动带来"没有新原料就不重压"（§19.8）。
+        #
+        # 必须独立 try/except：画像是**增强**，它的失败绝不能影响 dream 已经产出的结果。
+        # compress_profile 内部已经吞掉自己的异常，这层是防它自己被改坏。
+        try:
+            await compress_profile(
+                workspace_name,
+                observer,
+                observed,
+                run_id=run_id,
+                task_name=task_name,
+            )
+        except Exception as e:
+            logger.error(
+                f"[{run_id}] Profile compression failed: {e}",
+                exc_info=True,
+            )
+            accumulate_metric(task_name, "profile_compress_error", str(e), "blob")
 
         # Log final metrics
         duration_ms = (time.perf_counter() - start_time) * 1000

@@ -1220,6 +1220,50 @@ class SummarySettings(HonchoSettings):
     MAX_TOKENS_LONG: Annotated[int, Field(default=4000, gt=0, le=20_000)] = 4000
 
 
+class ProfileSettings(HonchoSettings):
+    """长期印象压缩（profile compression）设置。
+
+    把某个 (observer, observed) collection 里的**全部 explicit 观察**压成一份稳定的
+    "长期印象"，在 dream 收尾阶段运行，产出存进 ``Peer.internal_metadata``。
+
+    设计依据见 doc/memory_layer_decision.md §18（压缩优于截断）与 §19（变化时机与挂钩点）。
+    """
+
+    model_config = SettingsConfigDict(  # pyright: ignore
+        env_prefix="PROFILE_", env_nested_delimiter="__", extra="ignore"
+    )
+
+    ENABLED: bool = True
+
+    @staticmethod
+    def _MODEL_CONFIG_DEFAULT() -> ConfiguredModelSettings:
+        # Minimal default; extra knobs would merge into env/TOML overrides.
+        return ConfiguredModelSettings(
+            transport="openai",
+            model="gpt-5.4-mini",
+        )
+
+    MODEL_CONFIG: ConfiguredModelSettings = Field(default_factory=_MODEL_CONFIG_DEFAULT)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_model_config_defaults(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            _fill_defaults_for_nested_field(
+                cast(dict[str, Any], data),
+                "MODEL_CONFIG",
+                cls._MODEL_CONFIG_DEFAULT,
+            )
+        return data  # pyright: ignore[reportUnknownVariableType]
+
+    # 画像正文的输出上限。压缩的意义就是"小"，所以这个值刻意低于 summary。
+    MAX_TOKENS: Annotated[int, Field(default=1200, gt=0, le=10_000)] = 1200
+
+    # 一次性喂给压缩器的 explicit 观察条数上限（防超长输入）。
+    # 刻意给得宽——压缩器该看尽可能多的原料，由它按信息量取舍（§18.1）。
+    MAX_INPUT_OBSERVATIONS: Annotated[int, Field(default=400, gt=0, le=5000)] = 400
+
+
 class WebhookSettings(HonchoSettings):
     model_config = SettingsConfigDict(env_prefix="WEBHOOK_", extra="ignore")  # pyright: ignore
 
@@ -1593,6 +1637,7 @@ class AppSettings(HonchoSettings):
     DIALECTIC: DialecticSettings = Field(default_factory=DialecticSettings)
     PEER_CARD: PeerCardSettings = Field(default_factory=PeerCardSettings)
     SUMMARY: SummarySettings = Field(default_factory=SummarySettings)
+    PROFILE: ProfileSettings = Field(default_factory=ProfileSettings)
     WEBHOOK: WebhookSettings = Field(default_factory=WebhookSettings)
     METRICS: MetricsSettings = Field(default_factory=MetricsSettings)
     TELEMETRY: TelemetrySettings = Field(default_factory=TelemetrySettings)

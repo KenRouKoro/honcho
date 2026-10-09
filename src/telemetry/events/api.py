@@ -110,6 +110,9 @@ class GetContextEvent(BaseEvent):
     has_peer_card: bool = Field(
         default=False, description="Whether a peer card was returned"
     )
+    has_peer_profile: bool = Field(
+        default=False, description="Whether a compressed long-term profile was returned"
+    )
     search_query_provided: bool = Field(
         default=False, description="Whether semantic search query text was provided"
     )

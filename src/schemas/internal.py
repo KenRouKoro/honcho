@@ -21,6 +21,10 @@ class ReconcilerType(str, Enum):
     CLEANUP_QUEUE = "cleanup_queue"
 
 
+# `PeerProfile` 住在 `schemas/api.py`：它同时是落库形态与 `session.context()` 的
+# 响应字段，所以按"公开契约"处理（见那里对字段含义的说明）。
+
+
 # ---------------------------------------------------------------------------
 # Document / observation schemas (vector storage internals)
 # ---------------------------------------------------------------------------

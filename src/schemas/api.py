@@ -475,6 +475,48 @@ class Summary(BaseModel):
     token_count: int = Field(description="The number of tokens in the summary text")
 
 
+class PeerProfile(BaseModel):
+    """长期印象画像——把某个 peer 的**全部 explicit 观察**压成的稳定文本。
+
+    这不是 ``peer_representation`` 的替代品，而是与它**并列**的一层：
+
+    - ``peer_representation``：每轮按 ``search_query`` 现算的选择性子集，**每轮都变**
+    - ``peer_profile``：**全局 per user**、由 dream 收尾阶段压缩出来的稳定画像，**每天最多变几次**
+
+    稳定 = 可以进提示词的静态前缀、可以被 prompt cache 复用（见
+    doc/memory_layer_decision.md §18.4 的半静态带）。所以读取方应该把画像放在**前缀**，
+    表示放在**尾部**。
+
+    存储位置：``Peer.internal_metadata`` 里 label = ``"profile"`` 的值
+    （与 peer card 的 ``"peer_card"`` / ``"{observed}_peer_card"`` 并列）。**JSONB 列，无需迁移。**
+    与 peer card 的分工：card 是**稳定身份标记**（IDENTITY/ATTRIBUTE/RELATIONSHIP/INSTRUCTION，
+    ≤40 条）；profile 是**长期叙事**（生活、处境、关注、关系）——正是 card 刻意排除的那类内容。
+
+    ``observation_count`` / ``oldest`` / ``newest`` / ``truncated`` 是**刻意保留的来源元信息**：
+    读取方据此渲染出"这是一层压缩结果、原料多少条、覆盖到何时、有没有漏掉更早的"，
+    让模型知道可以再用检索补细节——把未知的未知变成已知的未知（§17 的 P3）。
+    """
+
+    text: str = Field(description="压缩后的画像正文（固定分节的 markdown）")
+    observation_count: int = Field(
+        default=0,
+        description=(
+            "本次压缩覆盖的 explicit 观察条数。"
+            "截断续压时含上一版画像间接覆盖的部分（累积值，是下界而非精确计数）。"
+        ),
+    )
+    oldest: str = Field(default="", description="覆盖范围的最早日期（ISO date）")
+    newest: str = Field(default="", description="覆盖范围的最新日期（ISO date）")
+    compressed_at: str = Field(default="", description="压缩时刻（ISO 8601，UTC）")
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "原料条数超过 ``PROFILE.MAX_INPUT_OBSERVATIONS``，本次只覆盖了最近一段。"
+            "读取方据此知道还有更早的原料没被压进来，可以主动去检索。"
+        ),
+    )
+
+
 class SessionContext(SessionBase):
     name: str = Field(serialization_alias="id")
     messages: list[Message]
@@ -488,6 +530,13 @@ class SessionContext(SessionBase):
     peer_card: list[str] | None = Field(
         default=None,
         description="The peer card, if context is requested from a specific perspective",
+    )
+    peer_profile: PeerProfile | None = Field(
+        default=None,
+        description=(
+            "The compressed long-term profile of the target peer, if one has been built. "
+            "Stable across turns (unlike peer_representation), so it belongs in the prompt's static prefix."
+        ),
     )
 
     model_config = ConfigDict(  # pyright: ignore

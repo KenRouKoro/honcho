@@ -47,7 +47,13 @@ from .peer import (
     reject_scope_peers,
     update_peer,
 )
-from .peer_card import get_peer_card, set_peer_card
+from .peer_card import (
+    PROFILE_LABEL,
+    get_peer_card,
+    get_peer_profile,
+    set_peer_card,
+    set_peer_profile,
+)
 from .representation import (
     get_working_representation,
 )
@@ -151,6 +157,10 @@ __all__ = [
     # Peer Card
     "get_peer_card",
     "set_peer_card",
+    # Peer Profile（长期印象压缩）
+    "PROFILE_LABEL",
+    "get_peer_profile",
+    "set_peer_profile",
     # Representation
     "get_working_representation",
     # Scope

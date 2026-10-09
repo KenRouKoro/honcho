@@ -776,6 +776,14 @@ def mock_llm_call_functions(request: pytest.FixtureRequest):
         patch(
             "src.utils.summarizer.create_long_summary", new_callable=AsyncMock
         ) as mock_long_summary,
+        # Profile compression is called directly from run_dream and reaches the LLM
+        # through `src.dreamer.profile.honcho_llm_call` — a *module-level* binding, so
+        # the `mock_honcho_llm_call` fixture below (which patches `src.llm`) does not
+        # reach it. Without this, every dream test that gets past the pre-flight skip
+        # would attempt a real provider call.
+        patch(
+            "src.dreamer.orchestrator.compress_profile", new_callable=AsyncMock
+        ) as mock_compress_profile,
         patch(
             "src.routers.peers.agentic_chat", new_callable=AsyncMock
         ) as mock_agentic_chat,
@@ -792,6 +800,7 @@ def mock_llm_call_functions(request: pytest.FixtureRequest):
         # Mock return values for different function types
         mock_short_summary.return_value = "Test short summary content"
         mock_long_summary.return_value = "Test long summary content"
+        mock_compress_profile.return_value = None
 
         # Mock agentic_chat to return a string (matching actual return type).
         # With a response_model (structured output) the real function returns
@@ -813,6 +822,7 @@ def mock_llm_call_functions(request: pytest.FixtureRequest):
         yield {
             "short_summary": mock_short_summary,
             "long_summary": mock_long_summary,
+            "compress_profile": mock_compress_profile,
             "agentic_chat": mock_agentic_chat,
             "agentic_chat_stream": mock_agentic_chat_stream,
             "workspace_chat": mock_workspace_chat,
@@ -987,6 +997,7 @@ def mock_tracked_db(request: pytest.FixtureRequest):
         "src.dialectic.core.tracked_db",
         "src.dreamer.specialists.tracked_db",
         "src.dreamer.surprisal.tracked_db",
+        "src.dreamer.profile.tracked_db",
         "src.deriver.scope_backfill.tracked_db",
     ]
     with ExitStack() as stack:

@@ -126,6 +126,30 @@ async def _get_peer_card_task(
     )
 
 
+async def _get_peer_profile_task(
+    db: AsyncSession,
+    workspace_id: str,
+    *,
+    peer_name: str,
+) -> schemas.PeerProfile | None:
+    """
+    Get the compressed long-term profile using an externally-provided DB session.
+
+    Unlike the peer card there is no observer dimension: the profile is keyed by the
+    observed peer only (doc/memory_layer_decision.md §18.6), so a single read serves
+    every perspective.
+
+    Args:
+        db: Database session to use for queries
+        workspace_id: The workspace identifier
+        peer_name: The peer the profile describes
+
+    Returns:
+        The profile or None if one has not been built
+    """
+    return await crud.get_peer_profile(db, workspace_id, peer_name=peer_name)
+
+
 async def _get_session_context_task(
     db: AsyncSession,
     workspace_id: str,
@@ -986,13 +1010,28 @@ async def get_session_context(
             db, workspace_id, observer=observer, observed=observed
         )
     )
+    # The profile is global per user (no session and no observer dimension), so it
+    # carries exactly the cross-session information an allowlist or a scope exists to
+    # exclude -- `crud.get_peer_profile` reads one row covering every session this peer
+    # ever appeared in. Same fail-closed reasoning as the card above, extended to
+    # `scope`: a scope narrows *which collections* are read (it swaps the observer),
+    # while there is only one profile per peer and nothing to narrow it to. So it is
+    # dropped in both cases rather than injected at full breadth.
+    profile = (
+        None
+        if effective_allowlist is not None or scope is not None
+        else await _get_peer_profile_task(db, workspace_id, peer_name=observed)
+    )
     short_summary, long_summary = await _get_both_summaries_task(
         db, workspace_id, session_id
     )
 
-    # Adjust token budget after accounting for representation + card tokens
+    # Adjust token budget after accounting for representation + card + profile tokens
     adjusted_limit = (
-        token_limit - estimate_tokens(str(representation)) - estimate_tokens(card)
+        token_limit
+        - estimate_tokens(str(representation))
+        - estimate_tokens(card)
+        - estimate_tokens(profile.text if profile else None)
     )
 
     # Pick best summary with 40/60 allocation against the adjusted budget
@@ -1011,6 +1050,7 @@ async def get_session_context(
         summary=summary,
         peer_representation=representation.format_as_markdown(),
         peer_card=card,
+        peer_profile=profile,
     )
     emit(
         GetContextEvent(
@@ -1024,6 +1064,7 @@ async def get_session_context(
             has_summary=summary is not None,
             has_representation=bool(response.peer_representation),
             has_peer_card=card is not None,
+            has_peer_profile=profile is not None,
             search_query_provided=search_query is not None,
             search_top_k=search_top_k,
             search_max_distance=search_max_distance,
