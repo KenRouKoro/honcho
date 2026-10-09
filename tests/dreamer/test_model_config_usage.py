@@ -52,6 +52,24 @@ def test_dreamer_user_prompts_include_target_observee() -> None:
         assert "Target observee:\nalice" in prompt
 
 
+def test_current_time_is_in_the_user_message_not_the_system_prompt() -> None:
+    """Observations carry timestamps but no clock (§24.2). The anchor has to reach
+    the specialist, but it must not go in the system prompt — that is the stable,
+    cacheable prefix (see the cache-prefix test above)."""
+    from datetime import UTC, datetime
+
+    from src.dreamer.specialists import current_time_block
+
+    block = current_time_block()
+    assert block.startswith("## CURRENT TIME\n")
+    assert datetime.now(UTC).strftime("%Y-%m-%d") in block
+
+    for specialist in (DeductionSpecialist(), InductionSpecialist()):
+        assert "CURRENT TIME" not in specialist.build_system_prompt(
+            "alice", peer_card_enabled=True
+        )
+
+
 def test_induction_prompt_has_no_peer_card_section() -> None:
     """Induction no longer writes to the peer card; its prompt must not reference it."""
     prompt = InductionSpecialist().build_system_prompt("alice", peer_card_enabled=True)
@@ -129,3 +147,10 @@ async def test_deduction_specialist_uses_nested_model_config(
     assert result.content == "done"
     assert kwargs["model_config"] == expected_config
     assert "llm_settings" not in kwargs
+
+    # The run loop must actually deliver the time anchor, and only in the user turn.
+    messages = kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith("## CURRENT TIME\n")
+    assert "CURRENT TIME" not in messages[0]["content"]

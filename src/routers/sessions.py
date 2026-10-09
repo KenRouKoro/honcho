@@ -201,6 +201,27 @@ async def _get_both_summaries_task(
     return short, long
 
 
+async def _get_session_extras_task(
+    db: AsyncSession,
+    workspace_id: str,
+    session_id: str,
+) -> tuple[schemas.SessionProfile | None, schemas.SessionStats | None]:
+    """Session-scoped extras: the stored place description and live statistics.
+
+    Both describe **only this session**, which is why they follow the `summary`
+    access rule rather than the peer card's: an allowlist or a scope narrows
+    *cross-session* recall, and there is nothing cross-session here. The peer card
+    and peer profile are dropped in those cases because one row covers every session
+    the peer appears in; this is the opposite.
+
+    Returns:
+        ``(session_profile, session_stats)`` — either may be None.
+    """
+    profile = await crud.get_session_profile(db, workspace_id, session_name=session_id)
+    stats = await crud.get_session_stats(db, workspace_id, session_name=session_id)
+    return profile, stats
+
+
 async def _get_messages_for_context_task(
     db: AsyncSession,
     workspace_id: str,
@@ -904,10 +925,15 @@ async def get_session_context(
         summary, messages = await _get_session_context_task(
             db, workspace_id, session_id, token_limit, include_summary
         )
+        session_profile, session_stats = await _get_session_extras_task(
+            db, workspace_id, session_id
+        )
         response = schemas.SessionContext(
             name=session_id,
             messages=messages,
             summary=summary,
+            session_profile=session_profile,
+            session_stats=session_stats,
         )
         emit(
             GetContextEvent(
@@ -917,6 +943,7 @@ async def get_session_context(
                 tokens_requested=tokens,
                 message_count=len(messages),
                 has_summary=summary is not None,
+                has_session_profile=session_profile is not None,
                 search_query_provided=search_query is not None,
                 search_top_k=search_top_k,
                 search_max_distance=search_max_distance,
@@ -1025,6 +1052,11 @@ async def get_session_context(
     short_summary, long_summary = await _get_both_summaries_task(
         db, workspace_id, session_id
     )
+    # Session-scoped, so *not* gated by the allowlist / scope the way the card and
+    # peer profile are (see `_get_session_extras_task`).
+    session_profile, session_stats = await _get_session_extras_task(
+        db, workspace_id, session_id
+    )
 
     # Adjust token budget after accounting for representation + card + profile tokens
     adjusted_limit = (
@@ -1051,6 +1083,8 @@ async def get_session_context(
         peer_representation=representation.format_as_markdown(),
         peer_card=card,
         peer_profile=profile,
+        session_profile=session_profile,
+        session_stats=session_stats,
     )
     emit(
         GetContextEvent(
@@ -1065,6 +1099,7 @@ async def get_session_context(
             has_representation=bool(response.peer_representation),
             has_peer_card=card is not None,
             has_peer_profile=profile is not None,
+            has_session_profile=session_profile is not None,
             search_query_provided=search_query is not None,
             search_top_k=search_top_k,
             search_max_distance=search_max_distance,

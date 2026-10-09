@@ -86,6 +86,12 @@ from .session import (
     set_peers_for_session,
     update_session,
 )
+from .session_profile import (
+    SESSION_PROFILE_LABEL,
+    get_session_profile,
+    set_session_profile,
+)
+from .session_stats import get_session_stats, stats_block
 from .webhook import (
     delete_webhook_endpoint,
     get_or_create_webhook_endpoint,
@@ -190,6 +196,12 @@ __all__ = [
     "set_peers_for_session",
     "get_peer_config",
     "set_peer_config",
+    # Session Profile（场地描述）与零 LLM 统计
+    "SESSION_PROFILE_LABEL",
+    "get_session_profile",
+    "set_session_profile",
+    "get_session_stats",
+    "stats_block",
     # Webhook
     "get_or_create_webhook_endpoint",
     "delete_webhook_endpoint",

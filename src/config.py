@@ -1264,6 +1264,68 @@ class ProfileSettings(HonchoSettings):
     MAX_INPUT_OBSERVATIONS: Annotated[int, Field(default=400, gt=0, le=5000)] = 400
 
 
+class SessionProfileSettings(HonchoSettings):
+    """场地描述压缩（session profile）设置。
+
+    peer 有"稳定标记（peer card）+ 长期叙事（peer profile）"两层，而 **session 一层都没有**——
+    只有一个每 20/60 条消息就重写一次的 summary（§23.1、§23.2）。
+    这一节补的就是 session 的那一层：把"这是什么地方"压成一份稳定的描述。
+
+    触发不挂 dream，而是跟着 `summary` 走（`deriver/consumer.py::process_summary_task`）：
+    summary 是**按 session 节流**的现成载体，而 dream 是按 `(observer, observed)` collection 调的
+    ——一个群有 N 个成员就有 N 个 collection，挂 dream 会让同一个群的描述被写 N 遍且互相打架
+    （§25.2）。所以这里用独立的条数节流常数，复用同一条队列路径。
+    """
+
+    model_config = SettingsConfigDict(  # pyright: ignore
+        env_prefix="SESSION_PROFILE_", env_nested_delimiter="__", extra="ignore"
+    )
+
+    ENABLED: bool = True
+
+    @staticmethod
+    def _MODEL_CONFIG_DEFAULT() -> ConfiguredModelSettings:
+        # Minimal default; extra knobs would merge into env/TOML overrides.
+        return ConfiguredModelSettings(
+            transport="openai",
+            model="gpt-5.4-mini",
+        )
+
+    MODEL_CONFIG: ConfiguredModelSettings = Field(default_factory=_MODEL_CONFIG_DEFAULT)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_model_config_defaults(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            _fill_defaults_for_nested_field(
+                cast(dict[str, Any], data),
+                "MODEL_CONFIG",
+                cls._MODEL_CONFIG_DEFAULT,
+            )
+        return data  # pyright: ignore[reportUnknownVariableType]
+
+    # 描述正文的输出上限。场地描述比个人画像长（要写氛围、话题域、黑话），所以给宽一点。
+    MAX_TOKENS: Annotated[int, Field(default=1600, gt=0, le=10_000)] = 1600
+
+    # 一次性喂给压缩器的 explicit 观察条数上限。
+    MAX_INPUT_OBSERVATIONS: Annotated[int, Field(default=400, gt=0, le=5000)] = 400
+
+    # 距上次刷新多少条消息才允许再刷。**刻意远大于 summary 的 20/60**：
+    # 场地描述是"稳定层"，一天刷几次就够；summary 才是流水。
+    MIN_MESSAGES_BETWEEN: Annotated[int, Field(default=200, gt=0, le=100_000)] = 200
+
+    # "常驻成员"的门槛（按**消息数**）。低于此数的人归入"偶尔出现"，
+    # 从未发言的人只由名册给出计数（§23.4、§23.5）。
+    REGULAR_MIN_MESSAGES: Annotated[int, Field(default=50, gt=0, le=100_000)] = 50
+
+    # 名册总数、群名等由客户端写进 `Session.metadata`；这里声明键名，
+    # 免得 Honcho 侧硬编码字符串（契约见 doc/memory_layer_decision.md §23.6）。
+    MEMBER_COUNT_METADATA_KEY: str = "member_count"
+    MAX_MEMBER_COUNT_METADATA_KEY: str = "max_member_count"
+    GROUP_NAME_METADATA_KEY: str = "group_name"
+    ADMINS_METADATA_KEY: str = "admins"
+
+
 class WebhookSettings(HonchoSettings):
     model_config = SettingsConfigDict(env_prefix="WEBHOOK_", extra="ignore")  # pyright: ignore
 
@@ -1412,6 +1474,13 @@ class DreamSettings(HonchoSettings):
         None
     )
     WINDOW_TIMEZONE: str = "UTC"
+
+    # Spread deferred dreams across the window instead of releasing them all at
+    # the window start. `clamp_wake_to_window` sends every due dream to the same
+    # instant, so without jitter the first hour of the window absorbs the whole
+    # collection's load (measured: 133 of 569 dreams landed in the 02:00 hour —
+    # doc/memory_layer_decision.md §24.2). 0 disables the jitter.
+    WINDOW_JITTER_MINUTES: Annotated[int, Field(default=180, ge=0, le=1440)] = 180
 
     # Agent iteration limit - increased for extended reasoning workflow
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20
@@ -1638,6 +1707,9 @@ class AppSettings(HonchoSettings):
     PEER_CARD: PeerCardSettings = Field(default_factory=PeerCardSettings)
     SUMMARY: SummarySettings = Field(default_factory=SummarySettings)
     PROFILE: ProfileSettings = Field(default_factory=ProfileSettings)
+    SESSION_PROFILE: SessionProfileSettings = Field(
+        default_factory=SessionProfileSettings
+    )
     WEBHOOK: WebhookSettings = Field(default_factory=WebhookSettings)
     METRICS: MetricsSettings = Field(default_factory=MetricsSettings)
     TELEMETRY: TelemetrySettings = Field(default_factory=TelemetrySettings)

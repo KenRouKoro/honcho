@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import random
 from datetime import UTC, datetime, timedelta
 from logging import getLogger
 from zoneinfo import ZoneInfo
@@ -53,6 +54,40 @@ def clamp_wake_to_window(
     return today_start.astimezone(UTC)
 
 
+def jitter_within_window(
+    wake: datetime,
+    *,
+    end_hour: int,
+    tz: ZoneInfo,
+    jitter_minutes: int,
+) -> datetime:
+    """Spread a deferred wake across the window's remaining span.
+
+    `clamp_wake_to_window` maps every due dream onto the *same* instant — the window
+    start — so without this the whole workspace's collections would fire together.
+    That is not hypothetical: of 569 dreams in the reference deployment, **133 landed
+    in the 02:00 hour** (doc/memory_layer_decision.md §24.2).
+
+    The offset is drawn uniformly from ``[0, jitter_minutes)`` and then trimmed so the
+    wake still lands inside the window (at least a minute of headroom is kept).
+    ``jitter_minutes=0`` disables it and returns ``wake`` unchanged.
+    """
+    if jitter_minutes <= 0:
+        return wake
+
+    local = wake.astimezone(tz)
+    window_end = local.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+    if window_end <= local:
+        # The window wraps midnight (e.g. 22 -> 6), or we are already past today's end.
+        window_end += timedelta(days=1)
+
+    headroom_minutes = (window_end - local).total_seconds() / 60.0
+    span = min(float(jitter_minutes), max(0.0, headroom_minutes - 1.0))
+    if span <= 0:
+        return wake
+    return wake + timedelta(minutes=random.uniform(0.0, span))
+
+
 class DreamScheduler:
     _instance: "DreamScheduler | None" = None
     _initialized: bool = False
@@ -103,21 +138,25 @@ class DreamScheduler:
         window_start = settings.DREAM.ALLOWED_WINDOW_START_HOUR
         window_end = settings.DREAM.ALLOWED_WINDOW_END_HOUR
         if window_start is not None and window_end is not None:
+            tz = ZoneInfo(settings.DREAM.WINDOW_TIMEZONE)
             wake = datetime.now(UTC) + timedelta(minutes=delay_minutes)
-            clamped = clamp_wake_to_window(
-                wake,
-                window_start,
-                window_end,
-                ZoneInfo(settings.DREAM.WINDOW_TIMEZONE),
-            )
+            clamped = clamp_wake_to_window(wake, window_start, window_end, tz)
             if clamped > wake:
+                # Without the jitter every deferred dream in the workspace wakes at the
+                # same instant (the window start). See `jitter_within_window`.
+                jittered = jitter_within_window(
+                    clamped,
+                    end_hour=window_end,
+                    tz=tz,
+                    jitter_minutes=settings.DREAM.WINDOW_JITTER_MINUTES,
+                )
                 logger.info(
                     "Deferring dream for %s into allowed window: %s -> %s",
                     work_unit_key,
                     wake.isoformat(),
-                    clamped.isoformat(),
+                    jittered.isoformat(),
                 )
-                delay_minutes = (clamped - datetime.now(UTC)).total_seconds() / 60
+                delay_minutes = (jittered - datetime.now(UTC)).total_seconds() / 60
 
         task = asyncio.create_task(
             self._delayed_dream(

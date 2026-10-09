@@ -12,4 +12,6 @@ _CASES = sorted(Path(__file__).parent.joinpath("test_cases").glob("*.json"))
 def test_unified_case_parses(path: Path) -> None:
     from tests.unified.schema import TestDefinition
 
-    TestDefinition(**json.loads(path.read_text()))
+    # Explicit encoding: the locale default (GBK on a zh-CN Windows box) cannot
+    # decode these UTF-8 case files, and the failure looks like a schema problem.
+    TestDefinition(**json.loads(path.read_text(encoding="utf-8")))

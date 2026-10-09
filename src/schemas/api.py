@@ -517,6 +517,74 @@ class PeerProfile(BaseModel):
     )
 
 
+class SessionProfile(BaseModel):
+    """场地描述——把"这是什么地方"压成一份稳定文本。
+
+    与 ``Summary`` 的分工（doc/memory_layer_decision.md §23.1、§23.2）：
+
+    - ``Summary``：**发生过什么**，每 20/60 条消息重建一次，内容持续漂移，是流水
+    - ``SessionProfile``：**这是什么地方**（氛围、规矩、话题域、黑话、成员构成），
+      低频刷新，**稳定**，可以进提示词的静态前缀
+
+    存储位置：``Session.internal_metadata`` 里 label = ``"session_profile"``。
+    **JSONB 列，无需迁移。**
+
+    ``observation_count`` / ``member_count`` / ``speaker_count`` /
+    ``lurker_count`` 等是**代码算出来的**元信息——数字不交给模型编（§25.3）。
+    ``lurker_count`` 尤其重要：**从未发言的人不会在 Honcho 里留下任何对象**，
+    只有客户端名册才知道他们存在（§23.4）。
+    """
+
+    text: str = Field(description="描述正文（固定分节的 markdown）")
+    observation_count: int = Field(
+        default=0, description="参与压缩的 explicit 观察条数"
+    )
+    sample_messages: int = Field(default=0, description="该 session 当时的消息总数")
+    speaker_count: int = Field(
+        default=0, description="说过话的 peer 数（Honcho 唯一知道的）"
+    )
+    member_count: int | None = Field(
+        default=None,
+        description="名册总人数，来自客户端的 Session.metadata；未知时 None",
+    )
+    lurker_count: int | None = Field(
+        default=None,
+        description="从未发言的人数 = member_count − speaker_count；名册未知时 None",
+    )
+    oldest: str = Field(default="", description="覆盖范围的最早日期（ISO date）")
+    newest: str = Field(default="", description="覆盖范围的最新日期（ISO date）")
+    compressed_at: str = Field(default="", description="压缩时刻（ISO 8601，UTC）")
+    truncated: bool = Field(
+        default=False, description="原料超过 MAX_INPUT_OBSERVATIONS，本次只覆盖最近一段"
+    )
+
+
+class SessionStats(BaseModel):
+    """零 LLM 的场地统计——每次请求实时算，永远新鲜。
+
+    与 ``SessionProfile`` 的关系：这里全是**代码算出来的数字**，
+    那边是**模型写出来的叙事**。数字永远不该让模型去数（§25.3）。
+
+    分层依据（§23.5）：``regular`` / ``occasional`` 按消息数分档，
+    ``lurker`` 只能由客户端名册给出——Honcho 里没有他们的任何痕迹。
+    """
+
+    group_name: str | None = Field(default=None, description="群名/场地名（名册）")
+    member_count: int | None = Field(default=None, description="名册总人数")
+    max_member_count: int | None = Field(default=None, description="人数上限")
+    admins: list[str] = Field(
+        default_factory=list, description="管理员 peer 名（名册）"
+    )
+    message_count: int = Field(default=0, description="该 session 的消息总数")
+    speaker_count: int = Field(default=0, description="说过话的人数")
+    regular_count: int = Field(default=0, description="常驻（消息数达门槛）")
+    occasional_count: int = Field(default=0, description="偶尔出现（说过话但未达门槛）")
+    lurker_count: int | None = Field(
+        default=None, description="纯潜水（从未发言）；名册未知时 None"
+    )
+    regular_min_messages: int = Field(default=0, description="判定「常驻」的消息数门槛")
+
+
 class SessionContext(SessionBase):
     name: str = Field(serialization_alias="id")
     messages: list[Message]
@@ -536,6 +604,21 @@ class SessionContext(SessionBase):
         description=(
             "The compressed long-term profile of the target peer, if one has been built. "
             "Stable across turns (unlike peer_representation), so it belongs in the prompt's static prefix."
+        ),
+    )
+    session_profile: SessionProfile | None = Field(
+        default=None,
+        description=(
+            "The compressed description of *this session* — what this place is, its norms, topics "
+            "and membership. Stable across turns, unlike the summary. Follows the same access rule as "
+            "`summary`: it describes only this session, so an allowlist or scope does not restrict it."
+        ),
+    )
+    session_stats: SessionStats | None = Field(
+        default=None,
+        description=(
+            "Live, LLM-free membership and volume statistics for this session. Cheap to compute and "
+            "always fresh; the numbers here are what `session_profile` was written from."
         ),
     )
 

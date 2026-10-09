@@ -13,6 +13,7 @@ from src.deriver.scope_backfill import (
     process_scope_removal,
 )
 from src.dreamer import process_dream
+from src.dreamer.session_profile import refresh_session_profile_if_needed
 from src.exceptions import ResourceNotFoundException, ValidationException
 from src.models import Message
 from src.reconciler.queue_cleanup import cleanup_queue_items
@@ -134,6 +135,20 @@ async def process_item(queue_item: models.QueueItem) -> None:
                 validated.configuration,
             )
             log_performance_metrics("summary", f"{workspace_name}_{message_id}")
+
+            # Session profile shares this hook rather than the dream path: a dream is
+            # scheduled per `(observer, observed)` collection, so a group with N members
+            # would rewrite its own description N times, from N different collections,
+            # with N different results. `summary` is the only per-session, message-count
+            # throttled hook that already exists. It carries its own (much larger)
+            # interval, so this is not a per-message cost.
+            # See doc/memory_layer_decision.md §25.2.
+            await refresh_session_profile_if_needed(
+                workspace_name,
+                validated.session_name,
+                validated.message_seq_in_session,
+                task_name=f"session_profile_{workspace_name}_{message_id}",
+            )
 
     elif task_type == "dream":
         with sentry_sdk.start_transaction(name="process_dream_task", op="deriver"):

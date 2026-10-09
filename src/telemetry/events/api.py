@@ -113,6 +113,10 @@ class GetContextEvent(BaseEvent):
     has_peer_profile: bool = Field(
         default=False, description="Whether a compressed long-term profile was returned"
     )
+    has_session_profile: bool = Field(
+        default=False,
+        description="Whether a compressed session (place) description was returned",
+    )
     search_query_provided: bool = Field(
         default=False, description="Whether semantic search query text was provided"
     )

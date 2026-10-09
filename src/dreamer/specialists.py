@@ -41,8 +41,30 @@ from src.utils.agent_tools import (
     INDUCTION_SPECIALIST_TOOLS,
     create_tool_executor,
 )
+from src.utils.formatting import utc_now_iso
 
 logger = logging.getLogger(__name__)
+
+
+def current_time_block() -> str:
+    """Prompt preamble anchoring the run in wall-clock time.
+
+    Retrieved observations carry timestamps but no clock, so without this the
+    specialist cannot tell a live "exam next week" from one that already happened —
+    which is exactly what the deduction specialist's *Knowledge Updates* job
+    (`# Knowledge Updates (HIGH PRIORITY)`) needs in order to decide which of two
+    conflicting statements is the current one. See doc/memory_layer_decision.md §24.2.
+
+    Deliberately part of the *user* message, not the system prompt: the system
+    prompt is the stable, cacheable prefix.
+    """
+    return (
+        "## CURRENT TIME\n\n"
+        f"Today is {utc_now_iso()[:10]} (UTC).\n"
+        "Retrieved observations are timestamped. Use this to judge whether a statement is\n"
+        "still current, has been superseded, or has already played out — and prefer the\n"
+        "newer statement when two conflict.\n\n"
+    )
 
 
 def _require_specialist_model_config(
@@ -304,7 +326,8 @@ If you update it, send the full deduplicated list and remove stale entries.
                 },
                 {
                     "role": "user",
-                    "content": self.build_user_prompt(
+                    "content": current_time_block()
+                    + self.build_user_prompt(
                         observed=observed,
                         hints=hints,
                         peer_card=current_peer_card,

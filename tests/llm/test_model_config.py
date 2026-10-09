@@ -423,7 +423,9 @@ def test_config_toml_example_uses_nested_model_config_sections() -> None:
 
 def test_env_template_uses_nested_model_config_keys() -> None:
     env_template_path = Path(__file__).resolve().parents[2] / ".env.template"
-    env_template = env_template_path.read_text()
+    # Explicit encoding: the template is UTF-8 and contains prose with non-ASCII
+    # characters, which the locale default (GBK on a zh-CN Windows box) cannot decode.
+    env_template = env_template_path.read_text(encoding="utf-8")
 
     assert "EMBEDDING_MODEL_CONFIG__MODEL" in env_template
     assert "EMBEDDING_VECTOR_DIMENSIONS" in env_template

@@ -13,6 +13,7 @@ from src.dreamer.dream_scheduler import (
     DreamScheduler,
     check_and_schedule_dream,
     clamp_wake_to_window,
+    jitter_within_window,
     set_dream_scheduler,
 )
 from src.schemas import DreamType
@@ -564,6 +565,11 @@ class TestScheduleDreamWindowDeferral:
                 "src.dreamer.dream_scheduler.settings.DREAM.WINDOW_TIMEZONE",
                 "Asia/Shanghai",
             ),
+            # Jitter is exercised separately; this test is about the *start* the
+            # deferral targets, which the jitter deliberately moves off.
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.WINDOW_JITTER_MINUTES", 0
+            ),
             patch("src.dreamer.dream_scheduler.datetime") as mock_datetime,
             patch.object(
                 dream_scheduler, "_delayed_dream", new_callable=AsyncMock
@@ -610,3 +616,46 @@ class TestScheduleDreamWindowDeferral:
             )
 
         assert mock_delayed.call_args.args[2] == 60
+
+
+class TestWindowJitter:
+    """Deferred dreams all used to land on the window start (133 of 569 in the
+    reference deployment's 02:00 hour — doc/memory_layer_decision.md §24.2)."""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+
+    def test_zero_disables_it(self):
+        wake = datetime(2026, 10, 10, 2, 0, tzinfo=self.TZ)
+        assert (
+            jitter_within_window(wake, end_hour=7, tz=self.TZ, jitter_minutes=0) == wake
+        )
+
+    def test_stays_inside_the_window_and_actually_spreads(self):
+        wake = datetime(2026, 10, 10, 2, 0, tzinfo=self.TZ)
+        offsets = set()
+        for _ in range(200):
+            jittered = jitter_within_window(
+                wake, end_hour=7, tz=self.TZ, jitter_minutes=180
+            )
+            local = jittered.astimezone(self.TZ)
+            assert wake <= jittered < wake.replace(hour=7)
+            offsets.add(local.hour)
+        # Not all samples collapse onto the first minute.
+        assert len(offsets) >= 2
+
+    def test_never_pushes_past_the_window_end(self):
+        """A wake already at the edge gets no jitter rather than escaping the window."""
+        wake = datetime(2026, 10, 10, 6, 59, tzinfo=self.TZ)
+        assert (
+            jitter_within_window(wake, end_hour=7, tz=self.TZ, jitter_minutes=180)
+            == wake
+        )
+
+    def test_window_wrapping_midnight(self):
+        wake = datetime(2026, 10, 10, 22, 0, tzinfo=self.TZ)
+        jittered = jitter_within_window(
+            wake, end_hour=6, tz=self.TZ, jitter_minutes=180
+        )
+        local = jittered.astimezone(self.TZ)
+        assert wake <= jittered
+        assert local.hour >= 22 or local.hour < 6
