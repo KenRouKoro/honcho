@@ -29,7 +29,11 @@ from src.llm.types import LLMTelemetryContext
 from src.schemas import ResolvedConfiguration
 from src.telemetry import prometheus_metrics
 from src.telemetry.events import DreamSpecialistEvent, emit
-from src.telemetry.logging import accumulate_metric, log_performance_metrics
+from src.telemetry.logging import (
+    accumulate_metric,
+    log_performance_metrics,
+    log_token_usage_metrics,
+)
 from src.telemetry.prometheus.metrics import TokenTypes
 from src.utils.agent_tools import (
     CARD_REFRESH_SPECIALIST_TOOLS,
@@ -374,9 +378,12 @@ If you update it, send the full deduplicated list and remove stale entries.
             accumulate_metric(
                 task_name, "tool_calls", len(response.tool_calls_made), "count"
             )
-            accumulate_metric(task_name, "input_tokens", response.input_tokens, "count")
-            accumulate_metric(
-                task_name, "output_tokens", response.output_tokens, "count"
+            log_token_usage_metrics(
+                task_name,
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read_input_tokens,
+                response.cache_creation_input_tokens,
             )
 
             # Prometheus metrics

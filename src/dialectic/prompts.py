@@ -3,6 +3,9 @@ System prompts for the Dialectic Agent.
 """
 
 from collections.abc import Iterable
+from datetime import UTC, datetime
+
+from src.utils.formatting import format_datetime_utc
 
 # Curated tool docs, keyed by the `name` each loadout actually exposes.
 # `_select_tools` filters this set per request (minimal / session allowlist).
@@ -118,12 +121,33 @@ def _render_tool_groups(
     return "\n\n".join(parts)
 
 
+def _now_section(now: datetime) -> str:
+    """Render the current-time anchor injected into dialectic system prompts.
+
+    Dialectic has no other source of "now": without it, "last week", "recently"
+    or "how long ago" cannot be resolved into absolute windows. Every timestamp
+    it reads back (message envelopes, conclusion prefixes) is UTC wall clock
+    rendered without a timezone marker, so the anchor is stated in UTC to match.
+    """
+    return (
+        "\n## CURRENT TIME\n"
+        f"Current time (UTC): {format_datetime_utc(now)}\n"
+        "All timestamps in messages and conclusions are UTC and are rendered "
+        "without a timezone marker. Convert relative expressions "
+        '("yesterday", "last week", "recently", "how long ago") into absolute '
+        "UTC dates using the current time above before filtering by date range. "
+        "Message bodies may embed application-local time text; when they do, "
+        "trust that text over the timestamp for what happened when.\n"
+    )
+
+
 def agent_system_prompt(
     observer: str,
     observed: str,
     observer_peer_card: list[str] | None,
     observed_peer_card: list[str] | None,
     available_tools: Iterable[str] | None = None,
+    now: datetime | None = None,
 ) -> str:
     """System prompt for pair-scoped dialectic recall.
 
@@ -134,7 +158,10 @@ def agent_system_prompt(
         observed_peer_card: Biographical information about the observed peer
         available_tools: Tool names offered on this request. Defaults to the
             full pair loadout.
+        now: Timestamp to anchor the prompt at. Defaults to the current UTC
+            time; pass an explicit value to keep a prompt deterministic.
     """
+    now_section = _now_section(now or datetime.now(UTC))
     # Determine if we have any peer card data
     peer_cards_enabled = (
         observer_peer_card is not None or observed_peer_card is not None
@@ -205,6 +232,7 @@ A **peer** is any participant, human or AI. A **session** is a conversation they
 
 Always give the asker the answer *they expect* based on the message history -- the goal is to help recall and *reason through* insights that the memory system has already gathered. Search wisely.
 
+{now_section}
 {perspective_section}
 {peer_card_explanation}
 ## TOOLS
@@ -349,8 +377,17 @@ Do not explain your tool usage - just provide the synthesized answer.
 
 def workspace_agent_system_prompt(
     available_tools: Iterable[str] | None = None,
+    now: datetime | None = None,
 ) -> str:
-    """System prompt for workspace-wide dialectic recall."""
+    """System prompt for workspace-wide dialectic recall.
+
+    Args:
+        available_tools: Tool names offered on this request. Defaults to the
+            full workspace loadout.
+        now: Timestamp to anchor the prompt at. Defaults to the current UTC
+            time; pass an explicit value to keep a prompt deterministic.
+    """
+    now_section = _now_section(now or datetime.now(UTC))
     tools = _available_tool_names(available_tools, WORKSPACE_PROMPT_TOOLS)
     tools_section = _render_tool_groups(tools, _WORKSPACE_TOOL_GROUPS)
     return f"""
@@ -376,6 +413,7 @@ A workspace is one isolated tenant. Everything you can see belongs to it. Inside
 
 You are not bound to any one peer. Discover who is relevant, then query each pair individually.
 
+{now_section}
 ## TOOLS
 
 Only the tools listed here are available on this query. If a later step names a tool you do not have, skip that step and use what you do have.

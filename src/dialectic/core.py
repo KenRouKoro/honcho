@@ -8,6 +8,7 @@ and synthesize responses to queries about a peer.
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from nanoid import generate as generate_nanoid
@@ -104,6 +105,10 @@ class DialecticAgent:
         self.observed_peer_card: list[str] | None = observed_peer_card
         self.metric_key: str | None = metric_key
         self.reasoning_level: ReasoningLevel = reasoning_level
+        # Anchor for the system prompt's CURRENT TIME section. Fixed once per
+        # request so every prompt rebuild (and the tests comparing them) see the
+        # same instant; the tool loop usually finishes well inside a minute.
+        self.now: datetime = datetime.now(UTC)
 
         # Initialize conversation history with system prompt
         self.messages: list[dict[str, str]] = [
@@ -119,6 +124,7 @@ class DialecticAgent:
                         for tool in self._select_tools()
                         if isinstance((name := tool.get("name")), str)
                     },
+                    now=self.now,
                 ),
             }
         ]

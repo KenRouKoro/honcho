@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Added
 
 - Qdrant vector store backend (`VECTOR_STORE_TYPE=qdrant`) as an optional `qdrant` extra (#683)
+- `start.ps1` at the repo root: one-command Windows launcher for the standard host setup — `uv sync`, a reachability check on the `DB_CONNECTION_URI` endpoint (existing PostgreSQL, no containers), Alembic migrations, then the API server and the deriver in one window with both logs interleaved. `-Quick` skips sync/migrations, `-Port` and `-NoDeriver` adjust the run
 
 ## [3.1.1] - 2026-09-02
 

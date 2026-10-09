@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import sentry_sdk
@@ -32,7 +32,7 @@ from src.dreamer.specialists import (
     SpecialistResult,
 )
 from src.dreamer.surprisal import SurprisalScore  # type: ignore
-from src.exceptions import SurprisalError
+from src.exceptions import ResourceNotFoundException, SurprisalError
 from src.schemas import DreamType
 from src.telemetry.events import DreamRunEvent, emit
 from src.telemetry.logging import (
@@ -122,6 +122,28 @@ async def run_dream(
         logger.info(
             f"[{run_id}] Dreams disabled for {workspace_name}/{session_name}, skipping dream"
         )
+        return None
+
+    # Pre-flight: skip when there is not enough new explicit material to
+    # consolidate. Auto-scheduled dreams pass the threshold gate in
+    # check_and_schedule_dream, but manually-enqueued dreams (the public
+    # schedule_dream route) bypass every guard — this is the last line of
+    # defense against burning specialist loops on nothing to consolidate.
+    # On skip the guard pair is NOT advanced, so the auto-scheduler can still
+    # fire later once enough material accumulates.
+    new_documents = await _count_new_explicit_documents(
+        workspace_name, observer, observed
+    )
+    if new_documents < settings.DREAM.DOCUMENT_THRESHOLD:
+        logger.info(
+            f"[{run_id}] Pre-flight skip for "
+            + f"{workspace_name}/{observer}/{observed}: {new_documents} new "
+            + "explicit documents (< threshold "
+            + f"{settings.DREAM.DOCUMENT_THRESHOLD})"
+        )
+        accumulate_metric(task_name, "preflight_skipped", 1, "count")
+        accumulate_metric(task_name, "preflight_new_documents", new_documents, "count")
+        log_performance_metrics("dream_orchestrator", run_id)
         return None
 
     # Track specialist outcomes
@@ -480,6 +502,88 @@ def _create_queries_from_surprisal(
     return queries[:10]  # Limit to 10 queries
 
 
+async def _count_new_explicit_documents(
+    workspace_name: str,
+    observer: str,
+    observed: str,
+) -> int:
+    """Explicit documents added since the collection's last completed dream.
+
+    Mirrors the threshold accounting in check_and_schedule_dream: the
+    baseline is ``last_dream_document_count`` (written by
+    _advance_dream_guard_pair), and only explicit-level documents count —
+    dreamer output would create a feedback loop. A missing collection means
+    nothing has ever been observed, i.e. zero new material.
+    """
+    async with tracked_db("dream.preflight", read_only=True) as db:
+        try:
+            collection = await crud.get_collection(
+                db, workspace_name, observer=observer, observed=observed
+            )
+        except ResourceNotFoundException:
+            return 0
+        baseline = collection.internal_metadata.get("dream", {}).get(
+            "last_dream_document_count", 0
+        )
+        count_stmt = select(func.count(models.Document.id)).where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == observer,
+            models.Document.observed == observed,
+            models.Document.level == "explicit",
+        )
+        current = int(await db.scalar(count_stmt) or 0)
+        return max(current - baseline, 0)
+
+
+async def _advance_dream_guard_pair(
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    now_iso: str,
+) -> None:
+    """Advance ``last_dream_at`` / ``last_dream_document_count`` after a dream.
+
+    A successful dream that produced no conclusions leaves no collection row
+    behind — collections materialize lazily with the first document — so there
+    is no scheduling baseline to advance. Skip rather than fail the task.
+    """
+    async with tracked_db("dream.guard_pair_write") as db:
+        try:
+            collection = await crud.get_collection(
+                db,
+                workspace_name,
+                observer=observer,
+                observed=observed,
+                with_for_update=True,
+            )
+        except ResourceNotFoundException:
+            logger.warning(
+                "Dream completed for %s/%s/%s but no collection exists; "
+                + "skipping guard-pair write",
+                workspace_name,
+                observer,
+                observed,
+            )
+            return
+        count_stmt = select(func.count(models.Document.id)).where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == observer,
+            models.Document.observed == observed,
+            models.Document.level == "explicit",
+        )
+        current_explicit_count = int(await db.scalar(count_stmt) or 0)
+        dream_meta = dict(collection.internal_metadata.get("dream", {}))
+        dream_meta["last_dream_at"] = now_iso
+        dream_meta["last_dream_document_count"] = current_explicit_count
+        await crud.update_collection_internal_metadata(
+            db,
+            workspace_name,
+            observer,
+            observed,
+            update_data={"dream": dream_meta},
+        )
+
+
 @sentry_sdk.trace
 async def process_dream(
     payload: DreamPayload,
@@ -523,32 +627,12 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
                     )
 
                     # Both guard fields advance together only on successful consolidation.
-                    now_iso = datetime.now(timezone.utc).isoformat()
-                    async with tracked_db("dream.guard_pair_write") as db:
-                        collection = await crud.get_collection(
-                            db,
-                            workspace_name,
-                            observer=payload.observer,
-                            observed=payload.observed,
-                            with_for_update=True,
-                        )
-                        count_stmt = select(func.count(models.Document.id)).where(
-                            models.Document.workspace_name == workspace_name,
-                            models.Document.observer == payload.observer,
-                            models.Document.observed == payload.observed,
-                            models.Document.level == "explicit",
-                        )
-                        current_explicit_count = int(await db.scalar(count_stmt) or 0)
-                        dream_meta = dict(collection.internal_metadata.get("dream", {}))
-                        dream_meta["last_dream_at"] = now_iso
-                        dream_meta["last_dream_document_count"] = current_explicit_count
-                        await crud.update_collection_internal_metadata(
-                            db,
-                            workspace_name,
-                            payload.observer,
-                            payload.observed,
-                            update_data={"dream": dream_meta},
-                        )
+                    await _advance_dream_guard_pair(
+                        workspace_name,
+                        payload.observer,
+                        payload.observed,
+                        datetime.now(UTC).isoformat(),
+                    )
 
             case DreamType.CARD_REFRESH:
                 # Card-only refresh: never touches observations and never

@@ -512,6 +512,19 @@ uv run python -m src.deriver
 
 The deriver generates representations, summaries, peer cards, and manages dreaming tasks. You can increase the number of derivers to improve runtime efficiency.
 
+#### One-click launcher (Windows)
+
+`start.ps1` in the repo root does the steps above in one command — dependency sync, the database check, migrations, then the API server and the deriver in a single window with both logs interleaved:
+
+```powershell
+.\start.ps1              # sync + migrate + API + deriver
+.\start.ps1 -Port 8901   # different API port
+.\start.ps1 -Quick       # skip `uv sync` and migrations, just start the processes
+.\start.ps1 -NoDeriver   # API server only
+```
+
+It reads `DB_CONNECTION_URI` from `.env` and expects that PostgreSQL to already be running — it starts no containers. Use the Docker path above or step 3 if you need a database first. Ctrl+C stops both processes. Requires PowerShell 5.1+.
+
 </details>
 <!-- markdownlint-enable MD033 -->
 

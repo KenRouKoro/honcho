@@ -15,7 +15,11 @@ from src.schemas import ResolvedConfiguration
 from src.telemetry import prometheus_metrics
 from src.telemetry.events import RepresentationCompletedEvent, emit
 from src.telemetry.events.llm import CallPurpose
-from src.telemetry.logging import accumulate_metric, log_performance_metrics
+from src.telemetry.logging import (
+    accumulate_metric,
+    log_performance_metrics,
+    log_token_usage_metrics,
+)
 from src.telemetry.prometheus.metrics import (
     DeriverComponents,
     DeriverTaskTypes,
@@ -278,6 +282,13 @@ async def process_representation_tasks_batch(
             "blob",
         )
 
+    log_token_usage_metrics(
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        response.input_tokens,
+        response.output_tokens,
+        response.cache_read_input_tokens,
+        response.cache_creation_input_tokens,
+    )
     log_performance_metrics("minimal_deriver", f"{latest_message.id}_{observed}")
 
     # token-breakdown fields derived from messages + cap snapshots.

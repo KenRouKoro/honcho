@@ -78,7 +78,7 @@ class TestPairAgentPrompt:
         catalog = _tools_catalog(agent.messages[0]["content"])
         assert _mentioned_tools(catalog) == offered
         assert agent.messages[0]["content"] == agent_system_prompt(
-            "alice", "alice", None, None, available_tools=offered
+            "alice", "alice", None, None, available_tools=offered, now=agent.now
         )
 
 
@@ -87,7 +87,7 @@ class TestWorkspaceAgentPrompt:
         agent = WorkspaceDialecticAgent(workspace_name="w", reasoning_level="minimal")
         offered = _loadout_names(WORKSPACE_TOOLS_MINIMAL)
         prompt = agent.messages[0]["content"]
-        assert prompt == workspace_agent_system_prompt(offered)
+        assert prompt == workspace_agent_system_prompt(offered, now=agent.now)
         catalog = _tools_catalog(prompt)
         assert _mentioned_tools(catalog) == offered
         assert "get_peer_card" not in catalog

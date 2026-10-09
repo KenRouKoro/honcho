@@ -70,7 +70,8 @@ class WorkspaceDialecticAgent(DialecticAgent):
                     name
                     for tool in self._select_tools()
                     if isinstance((name := tool.get("name")), str)
-                }
+                },
+                now=self.now,
             ),
         }
 

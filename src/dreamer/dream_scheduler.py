@@ -1,7 +1,8 @@
 import asyncio
 import contextlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from logging import getLogger
+from zoneinfo import ZoneInfo
 
 import sentry_sdk
 from sqlalchemy import exists, func, select
@@ -30,6 +31,28 @@ def get_dream_scheduler() -> "DreamScheduler | None":
     return _dream_scheduler
 
 
+def clamp_wake_to_window(
+    wake: datetime, start_hour: int, end_hour: int, tz: ZoneInfo
+) -> datetime:
+    """Clamp a wake time into the daily allowed window [start_hour, end_hour).
+
+    The window is interpreted in `tz` local time and may wrap midnight
+    (e.g. start=22, end=6). If `wake` already falls inside the window it is
+    returned unchanged; otherwise the next window start is returned (UTC).
+    """
+    local = wake.astimezone(tz)
+    today_start = local.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    if start_hour < end_hour:
+        in_window = start_hour <= local.hour < end_hour
+    else:
+        in_window = local.hour >= start_hour or local.hour < end_hour
+    if in_window:
+        return wake
+    if local >= today_start:
+        today_start += timedelta(days=1)
+    return today_start.astimezone(UTC)
+
+
 class DreamScheduler:
     _instance: "DreamScheduler | None" = None
     _initialized: bool = False
@@ -55,7 +78,7 @@ class DreamScheduler:
         self,
         work_unit_key: str,
         workspace_name: str,
-        delay_minutes: int,
+        delay_minutes: float,
         dream_type: DreamType,
         *,
         observer: str,
@@ -76,6 +99,25 @@ class DreamScheduler:
 
         # Cancel any existing dream for this collection
         await self.cancel_dream(work_unit_key)
+
+        window_start = settings.DREAM.ALLOWED_WINDOW_START_HOUR
+        window_end = settings.DREAM.ALLOWED_WINDOW_END_HOUR
+        if window_start is not None and window_end is not None:
+            wake = datetime.now(UTC) + timedelta(minutes=delay_minutes)
+            clamped = clamp_wake_to_window(
+                wake,
+                window_start,
+                window_end,
+                ZoneInfo(settings.DREAM.WINDOW_TIMEZONE),
+            )
+            if clamped > wake:
+                logger.info(
+                    "Deferring dream for %s into allowed window: %s -> %s",
+                    work_unit_key,
+                    wake.isoformat(),
+                    clamped.isoformat(),
+                )
+                delay_minutes = (clamped - datetime.now(UTC)).total_seconds() / 60
 
         task = asyncio.create_task(
             self._delayed_dream(
@@ -117,7 +159,6 @@ class DreamScheduler:
         Args:
             workspace_name: The workspace to match
             observed: The observed peer name to match
-
         Returns:
             Set of work_unit_keys that were cancelled
         """
@@ -141,7 +182,7 @@ class DreamScheduler:
         self,
         work_unit_key: str,
         workspace_name: str,
-        delay_minutes: int,
+        delay_minutes: float,
         dream_type: DreamType,
         *,
         observer: str,
@@ -315,7 +356,7 @@ async def check_and_schedule_dream(
             try:
                 last_dream_time = datetime.fromisoformat(last_dream_at)
                 hours_since_last_dream = (
-                    datetime.now(timezone.utc) - last_dream_time
+                    datetime.now(UTC) - last_dream_time
                 ).total_seconds() / 3600
 
                 if hours_since_last_dream < settings.DREAM.MIN_HOURS_BETWEEN_DREAMS:

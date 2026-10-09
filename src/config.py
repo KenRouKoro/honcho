@@ -1,11 +1,12 @@
 import logging
 import math
 import os
+import tomllib
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, cast, get_args
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import tomllib
 from dotenv import load_dotenv
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic.fields import FieldInfo
@@ -1356,6 +1357,18 @@ class DreamSettings(HonchoSettings):
     DUE_POLL_INTERVAL_SECONDS: Annotated[int, Field(default=300, ge=1)] = 300
     ENABLED_TYPES: list[str] = ["omni"]
 
+    # Optional daily window (local time in WINDOW_TIMEZONE) during which dreams
+    # may fire. Dreams triggered outside the window are deferred to the next
+    # window start — useful for off-peak LLM pricing. Both hours must be set
+    # together; the window may wrap midnight (e.g. START=22, END=6).
+    ALLOWED_WINDOW_START_HOUR: Annotated[
+        int | None, Field(default=None, ge=0, le=23)
+    ] = None
+    ALLOWED_WINDOW_END_HOUR: Annotated[int | None, Field(default=None, ge=0, le=23)] = (
+        None
+    )
+    WINDOW_TIMEZONE: str = "UTC"
+
     # Agent iteration limit - increased for extended reasoning workflow
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20
 
@@ -1424,6 +1437,28 @@ class DreamSettings(HonchoSettings):
                     f"dream.{name}.max_output_tokens must be greater than "
                     + f"dream.{name}.thinking_budget_tokens"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_allowed_window(self) -> "DreamSettings":
+        start, end = self.ALLOWED_WINDOW_START_HOUR, self.ALLOWED_WINDOW_END_HOUR
+        if (start is None) != (end is None):
+            raise ValueError(
+                "ALLOWED_WINDOW_START_HOUR and ALLOWED_WINDOW_END_HOUR "
+                + "must be set together"
+            )
+        if start is not None and start == end:
+            raise ValueError(
+                "ALLOWED_WINDOW_START_HOUR must differ from ALLOWED_WINDOW_END_HOUR"
+            )
+        if start is not None:
+            try:
+                ZoneInfo(self.WINDOW_TIMEZONE)
+            except ZoneInfoNotFoundError as e:
+                raise ValueError(
+                    f"WINDOW_TIMEZONE {self.WINDOW_TIMEZONE!r} "
+                    + "is not a valid IANA timezone"
+                ) from e
         return self
 
 

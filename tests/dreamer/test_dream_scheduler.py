@@ -1,7 +1,9 @@
 """Regression tests for dream scheduler bug fixes."""
 
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +12,7 @@ from src import models
 from src.dreamer.dream_scheduler import (
     DreamScheduler,
     check_and_schedule_dream,
+    clamp_wake_to_window,
     set_dream_scheduler,
 )
 from src.schemas import DreamType
@@ -23,8 +26,17 @@ def dream_scheduler():
     DreamScheduler.reset_singleton()
     scheduler = DreamScheduler()
     set_dream_scheduler(scheduler)
-    # Patch DREAM.ENABLED to True so tests work regardless of local config
-    with patch("src.dreamer.dream_scheduler.settings.DREAM.ENABLED", True):
+    with (
+        patch("src.dreamer.dream_scheduler.settings.DREAM.ENABLED", True),
+        patch(
+            "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+            None,
+        ),
+        patch(
+            "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR",
+            None,
+        ),
+    ):
         yield scheduler
     # Cleanup
     DreamScheduler.reset_singleton()
@@ -470,3 +482,131 @@ class TestEnqueueCancelsDreamsCorrectly:
         # All three dreams should be cancelled
         assert len(cancelled) == 3
         assert len(dream_scheduler.pending_dreams) == 0
+
+
+class TestClampWakeToWindow:
+    """Boundary tests for the off-peak allowed-window clamp.
+
+    Asia/Shanghai is UTC+8 with no DST, which keeps the UTC expectations
+    arithmetic simple.
+    """
+
+    tz = ZoneInfo("Asia/Shanghai")
+
+    def test_inside_window_unchanged(self):
+        # 03:00 +08 inside window 2-7
+        wake = datetime(2026, 9, 11, 19, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 2, 7, self.tz) == wake
+
+    def test_before_window_defers_to_today_start(self):
+        # 01:00 +08 -> today 02:00 +08 = 18:00 UTC previous day
+        wake = datetime(2026, 9, 11, 17, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 2, 7, self.tz) == datetime(
+            2026, 9, 11, 18, 0, tzinfo=UTC
+        )
+
+    def test_after_window_defers_to_tomorrow_start(self):
+        # 10:00 +08 -> tomorrow 02:00 +08 = 18:00 UTC same day
+        wake = datetime(2026, 9, 12, 2, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 2, 7, self.tz) == datetime(
+            2026, 9, 12, 18, 0, tzinfo=UTC
+        )
+
+    def test_overnight_window_late_evening_inside(self):
+        # 23:00 +08 inside overnight window 22-6
+        wake = datetime(2026, 9, 12, 15, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 22, 6, self.tz) == wake
+
+    def test_overnight_window_early_morning_inside(self):
+        # 03:00 +08 inside overnight window 22-6
+        wake = datetime(2026, 9, 11, 19, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 22, 6, self.tz) == wake
+
+    def test_overnight_window_daytime_defers_to_evening(self):
+        # 12:00 +08 -> today 22:00 +08 = 14:00 UTC same day
+        wake = datetime(2026, 9, 12, 4, 0, tzinfo=UTC)
+        assert clamp_wake_to_window(wake, 22, 6, self.tz) == datetime(
+            2026, 9, 12, 14, 0, tzinfo=UTC
+        )
+
+
+class TestScheduleDreamWindowDeferral:
+    """schedule_dream must push the wake time into the configured window."""
+
+    @pytest.mark.asyncio
+    async def test_delay_extended_to_next_window_start(
+        self, dream_scheduler: DreamScheduler
+    ):
+        workspace_name = "test_workspace"
+        work_unit_key = construct_work_unit_key(
+            workspace_name,
+            {
+                "task_type": "dream",
+                "observer": "alice",
+                "observed": "alice",
+                "dream_type": "omni",
+            },
+        )
+
+        # 10:00 +08 = 02:00 UTC; window 2-7 -> next start 2026-09-13 02:00 +08,
+        # i.e. 16 hours after the fake now.
+        fake_now = datetime(2026, 9, 12, 2, 0, tzinfo=UTC)
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+                2,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR",
+                7,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.WINDOW_TIMEZONE",
+                "Asia/Shanghai",
+            ),
+            patch("src.dreamer.dream_scheduler.datetime") as mock_datetime,
+            patch.object(
+                dream_scheduler, "_delayed_dream", new_callable=AsyncMock
+            ) as mock_delayed,
+        ):
+            mock_datetime.now.return_value = fake_now
+            await dream_scheduler.schedule_dream(
+                work_unit_key,
+                workspace_name,
+                delay_minutes=60,
+                dream_type=DreamType.OMNI,
+                observer="alice",
+                observed="alice",
+            )
+
+        deferred_delay = mock_delayed.call_args.args[2]
+        assert deferred_delay == pytest.approx(16 * 60, abs=1)
+
+    @pytest.mark.asyncio
+    async def test_no_window_leaves_delay_untouched(
+        self, dream_scheduler: DreamScheduler
+    ):
+        workspace_name = "test_workspace"
+        work_unit_key = construct_work_unit_key(
+            workspace_name,
+            {
+                "task_type": "dream",
+                "observer": "alice",
+                "observed": "alice",
+                "dream_type": "omni",
+            },
+        )
+
+        with patch.object(
+            dream_scheduler, "_delayed_dream", new_callable=AsyncMock
+        ) as mock_delayed:
+            await dream_scheduler.schedule_dream(
+                work_unit_key,
+                workspace_name,
+                delay_minutes=60,
+                dream_type=DreamType.OMNI,
+                observer="alice",
+                observed="alice",
+            )
+
+        assert mock_delayed.call_args.args[2] == 60

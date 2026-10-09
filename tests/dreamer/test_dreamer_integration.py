@@ -7,9 +7,10 @@ collection's internal_metadata on successful dreams — and critically,
 does NOT land on failures or exceptions.
 """
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -23,7 +24,7 @@ from src.dreamer.dream_scheduler import (
     check_and_schedule_dream,
     set_dream_scheduler,
 )
-from src.dreamer.orchestrator import DreamResult, process_dream
+from src.dreamer.orchestrator import DreamResult, process_dream, run_dream
 from src.schemas import (
     DreamType,
     ResolvedConfiguration,
@@ -104,19 +105,19 @@ class TestLastDreamAtCompletionWrite:
             await process_dream(payload, seeded_collection.workspace_name)
 
         dream_meta = await _get_dream_metadata(db_session, seeded_collection)
-        assert (
-            "last_dream_at" in dream_meta
-        ), "process_dream must write last_dream_at when run_dream returns a result"
+        assert "last_dream_at" in dream_meta, (
+            "process_dream must write last_dream_at when run_dream returns a result"
+        )
         # Must be a tz-aware UTC ISO timestamp. A naive datetime.now().isoformat()
         # would pass a loose "T in string" check but corrupt the 8h guard math
         # against tz-aware now() comparisons downstream.
         parsed = datetime.fromisoformat(dream_meta["last_dream_at"])
-        assert (
-            parsed.tzinfo is not None
-        ), f"last_dream_at must be timezone-aware, got {dream_meta['last_dream_at']!r}"
-        assert parsed.utcoffset() == timedelta(
-            0
-        ), f"last_dream_at must be UTC, got offset {parsed.utcoffset()}"
+        assert parsed.tzinfo is not None, (
+            f"last_dream_at must be timezone-aware, got {dream_meta['last_dream_at']!r}"
+        )
+        assert parsed.utcoffset() == timedelta(0), (
+            f"last_dream_at must be UTC, got offset {parsed.utcoffset()}"
+        )
 
     @pytest.mark.asyncio
     async def test_failure_path_leaves_last_dream_at_null(
@@ -233,6 +234,56 @@ class TestLastDreamAtCompletionWrite:
             "process_dream swallows the exception but the guard write must "
             "not occur."
         )
+
+
+class TestMissingCollectionGuardWrite:
+    """A dream can succeed for a pair whose collection row does not exist.
+
+    Collections materialize lazily with the first document, so a manually
+    scheduled dream over a pair whose specialists produce nothing ends with no
+    collection to write the guard pair to. The write must be skipped — not
+    reported as a task error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_collection_skips_guard_write(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        caplog: pytest.LogCaptureFixture,
+    ):
+        workspace, peer = sample_data
+        payload = DreamPayload(
+            dream_type=DreamType.OMNI,
+            observer=peer.name,
+            observed=peer.name,
+        )
+
+        with (
+            patch(
+                "src.dreamer.orchestrator.run_dream",
+                new=AsyncMock(return_value=_make_dream_result()),
+            ),
+            caplog.at_level(logging.WARNING, logger="src.dreamer.orchestrator"),
+        ):
+            await process_dream(payload, workspace.name)
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            "a missing collection after a successful dream is not an error; "
+            "the guard-pair write must be skipped"
+        )
+        assert any("skipping guard-pair write" in r.message for r in caplog.records), (
+            "the skip must be logged so the missing baseline is diagnosable"
+        )
+
+        # No collection row may be materialized as a side effect — an empty
+        # row would enter scheduler enumeration with a phantom baseline.
+        stmt = select(models.Collection).where(
+            models.Collection.workspace_name == workspace.name,
+            models.Collection.observer == peer.name,
+            models.Collection.observed == peer.name,
+        )
+        assert (await db_session.execute(stmt)).scalar_one_or_none() is None
 
 
 class TestEnqueueDreamLeavesMetadataAlone:
@@ -582,9 +633,9 @@ class TestGuardPairCoherence:
             "pre-Loop-4 the baseline was consumed at enqueue time and a "
             "silent failure would lock out retries on the same corpus."
         )
-        assert (
-            "last_dream_at" not in dream_meta
-        ), "Failed dream must not advance last_dream_at either."
+        assert "last_dream_at" not in dream_meta, (
+            "Failed dream must not advance last_dream_at either."
+        )
 
         with patch.object(
             _scheduler, "schedule_dream", new_callable=AsyncMock
@@ -597,3 +648,143 @@ class TestGuardPairCoherence:
             "last_dream_at, no pending queue item."
         )
         assert mock_schedule.called, "schedule_dream must be invoked on the retry path."
+
+
+class TestDreamPreflight:
+    """Pre-flight skip: insufficient new explicit material must not reach the
+    specialist loop (the LLM spend). Manual dream enqueues bypass the
+    threshold gate in check_and_schedule_dream, so run_dream re-checks."""
+
+    def _mock_specialists(self) -> dict[str, MagicMock]:
+        result = MagicMock(
+            content="done", success=True, iterations=1, input_tokens=10, output_tokens=5
+        )
+        return {
+            "deduction": MagicMock(run=AsyncMock(return_value=result)),
+            "induction": MagicMock(run=AsyncMock(return_value=result)),
+        }
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_skips_specialists(
+        self,
+        db_session: AsyncSession,
+        seeded_collection: models.Collection,
+    ):
+        workspace_name = seeded_collection.workspace_name
+        for i in range(2):
+            db_session.add(
+                models.Document(
+                    content=f"explicit {i}",
+                    level="explicit",
+                    workspace_name=workspace_name,
+                    observer=seeded_collection.observer,
+                    observed=seeded_collection.observed,
+                )
+            )
+        await db_session.commit()
+
+        specialists = self._mock_specialists()
+        with (
+            patch("src.dreamer.orchestrator.settings.DREAM.DOCUMENT_THRESHOLD", 3),
+            patch.dict("src.dreamer.orchestrator.SPECIALISTS", specialists),
+        ):
+            result = await run_dream(
+                workspace_name,
+                seeded_collection.observer,
+                seeded_collection.observed,
+            )
+
+        assert result is None
+        specialists["deduction"].run.assert_not_called()
+        specialists["induction"].run.assert_not_called()
+        dream_meta = await _get_dream_metadata(db_session, seeded_collection)
+        assert "last_dream_at" not in dream_meta, (
+            "Pre-flight skip must not advance the guard pair — the "
+            "auto-scheduler needs the baseline intact to fire later."
+        )
+
+    @pytest.mark.asyncio
+    async def test_baseline_subtracted_from_current_count(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Only documents NEW since the last dream count toward the bar."""
+        workspace, peer = sample_data
+        collection = models.Collection(
+            observer=peer.name,
+            observed=peer.name,
+            workspace_name=workspace.name,
+            internal_metadata={"dream": {"last_dream_document_count": 5}},
+        )
+        db_session.add(collection)
+        for i in range(7):
+            db_session.add(
+                models.Document(
+                    content=f"explicit {i}",
+                    level="explicit",
+                    workspace_name=workspace.name,
+                    observer=peer.name,
+                    observed=peer.name,
+                )
+            )
+        await db_session.commit()
+
+        specialists = self._mock_specialists()
+        with (
+            patch("src.dreamer.orchestrator.settings.DREAM.DOCUMENT_THRESHOLD", 3),
+            patch.dict("src.dreamer.orchestrator.SPECIALISTS", specialists),
+        ):
+            result = await run_dream(workspace.name, peer.name, peer.name)
+
+        assert result is None, "7 current - 5 baseline = 2 new < threshold 3"
+        specialists["deduction"].run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_runs_specialists(
+        self,
+        db_session: AsyncSession,
+        seeded_collection: models.Collection,
+    ):
+        workspace_name = seeded_collection.workspace_name
+        for i in range(3):
+            db_session.add(
+                models.Document(
+                    content=f"explicit {i}",
+                    level="explicit",
+                    workspace_name=workspace_name,
+                    observer=seeded_collection.observer,
+                    observed=seeded_collection.observed,
+                )
+            )
+        await db_session.commit()
+
+        specialists = self._mock_specialists()
+        with (
+            patch("src.dreamer.orchestrator.settings.DREAM.DOCUMENT_THRESHOLD", 3),
+            patch.dict("src.dreamer.orchestrator.SPECIALISTS", specialists),
+        ):
+            result = await run_dream(
+                workspace_name,
+                seeded_collection.observer,
+                seeded_collection.observed,
+            )
+
+        assert result is not None
+        specialists["deduction"].run.assert_called_once()
+        specialists["induction"].run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_collection_skips(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """A dream enqueued for a never-observed peer has zero material."""
+        workspace, peer = sample_data
+        specialists = self._mock_specialists()
+        with patch.dict("src.dreamer.orchestrator.SPECIALISTS", specialists):
+            result = await run_dream(workspace.name, peer.name, peer.name)
+
+        assert result is None
+        specialists["deduction"].run.assert_not_called()

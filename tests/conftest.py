@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
@@ -37,6 +39,10 @@ from src.dependencies import get_db, get_read_db
 from src.exceptions import HonchoException
 from src.models import Peer, Workspace
 from src.security import JWTParams, create_admin_jwt, create_jwt
+
+# psycopg async cannot run under the Windows-default ProactorEventLoop.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Disable Langfuse for the whole suite before importing src.main: @conditional_observe
 # binds to settings.LANGFUSE_PUBLIC_KEY at import time, so blanking it here keeps mocked
@@ -287,7 +293,9 @@ async def setup_test_database(db_url: URL):
     Returns:
         engine: SQLAlchemy engine
     """
-    engine = create_async_engine(str(db_url), echo=False)
+    engine = create_async_engine(
+        db_url.render_as_string(hide_password=False), echo=False
+    )
     async with engine.connect() as conn:
         try:
             logger.info("Attempting to create pgvector extension...")

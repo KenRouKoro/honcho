@@ -7,6 +7,7 @@ metrics from deriver and dialectic operations during benchmarking.
 
 import json
 import logging
+import os
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -319,11 +320,6 @@ def append_metrics_to_file(
 
     import time
 
-    try:
-        import fcntl
-    except ImportError:  # Windows — stdlib fcntl is Unix-only
-        import winfcntl as fcntl
-
     # Prepare metrics data
     timestamp = time.time()
     metrics_entry = {
@@ -335,11 +331,29 @@ def append_metrics_to_file(
         ],
     }
 
-    # Use file locking to handle concurrent writes from multiple processes
-    with open(metrics_file, "a") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        f.write(json.dumps(metrics_entry) + "\n")
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    # Use file locking to handle concurrent writes from multiple processes.
+    # winfcntl's flock is broken on Windows (passes NULL OVERLAPPED to
+    # LockFileEx), so use msvcrt.locking there and stdlib fcntl elsewhere.
+    if os.name == "nt":
+        import msvcrt
+
+        with open(metrics_file, "a") as f:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                f.write(json.dumps(metrics_entry) + "\n")
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        with open(metrics_file, "a") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(metrics_entry) + "\n")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_metrics_from_file(

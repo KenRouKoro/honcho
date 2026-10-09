@@ -239,6 +239,19 @@ uv run python -m src.deriver
 
 The deriver is essential for Honcho's core functionality. It processes incoming messages to extract observations, build peer representations, generate session summaries, and run dream consolidation. Without it, messages will be stored but no memory or reasoning will occur.
 
+### 8. One-click launcher (Windows)
+
+On Windows, `start.ps1` in the repo root automates steps 1-7 — dependency sync, the database check, migrations, then the API server and the deriver in a single window with both logs interleaved:
+
+```powershell
+.\start.ps1              # sync + migrate + API + deriver
+.\start.ps1 -Port 8901   # different API port
+.\start.ps1 -Quick       # skip `uv sync` and migrations, just start the processes
+.\start.ps1 -NoDeriver   # API server only
+```
+
+It reads `DB_CONNECTION_URI` from `.env` and expects that PostgreSQL to already be running — it starts no containers. Use the [Docker Compose path](#from-source-docker-compose) or the step 2 options if you need a database first. Ctrl+C stops both processes. Requires PowerShell 5.1+; 7+ recommended.
+
 ## Cloud Database Setup
 
 If you prefer to use a managed PostgreSQL service:

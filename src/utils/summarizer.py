@@ -22,7 +22,11 @@ from src.models import Message
 from src.telemetry import prometheus_metrics
 from src.telemetry.events import AgentToolSummaryCreatedEvent, emit
 from src.telemetry.events.llm import CallPurpose
-from src.telemetry.logging import accumulate_metric, conditional_observe
+from src.telemetry.logging import (
+    accumulate_metric,
+    conditional_observe,
+    log_token_usage_metrics,
+)
 from src.telemetry.prometheus.metrics import (
     DeriverComponents,
     DeriverTaskTypes,
@@ -526,6 +530,14 @@ async def _create_and_save_summary(
         summary_duration,
         "ms",
     )
+    if not is_fallback:
+        log_token_usage_metrics(
+            f"summary_{workspace_name}_{message_id}",
+            llm_input_tokens,
+            llm_output_tokens,
+            0,
+            0,
+        )
 
     # Emit telemetry event (only for non-fallback summaries).
     if not is_fallback:
