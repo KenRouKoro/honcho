@@ -271,9 +271,21 @@ class TestCompressProfile:
 
 class TestProfilePrompt:
     def test_uses_the_fixed_section_set(self):
-        prompt = profile_prompt("x", observation_count=1, max_tokens=1000)
+        prompt = profile_prompt(
+            "x", observation_count=1, max_tokens=1000, today="2026-01-05"
+        )
         for name, _ in PROFILE_SECTIONS:
             assert f"## {name}" in prompt
+
+    def test_observation_dates_have_a_now_anchor(self):
+        """Observation lines carry dates but no clock. Without `today` the model
+        cannot tell a stale 下周考试 from a live one, and 待跟进 accumulates
+        resolved threads forever."""
+        prompt = profile_prompt(
+            "[2026-01-01] x", observation_count=1, max_tokens=1000, today="2026-03-09"
+        )
+        assert "今天是 2026-03-09" in prompt
+        assert "用「今天」判断时效" in prompt
 
     def test_interpolated_blocks_are_flush_left(self):
         """`cleandoc` must run before interpolation — see the comment in profile_prompt.
@@ -286,6 +298,7 @@ class TestProfilePrompt:
             "[2026-01-01] x",
             observation_count=1,
             max_tokens=1000,
+            today="2026-01-05",
             previous_profile_text="## 旧\n- y",
         )
         assert prompt.startswith("你是长期记忆的压缩器。")

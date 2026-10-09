@@ -76,6 +76,7 @@ def profile_prompt(
     *,
     observation_count: int,
     max_tokens: int,
+    today: str,
     previous_profile_text: str | None = None,
 ) -> str:
     """构造压缩提示词。
@@ -84,6 +85,8 @@ def profile_prompt(
         observations_text: 已格式化的观察列表（时间正序）
         observation_count: 参与本次压缩的观察条数
         max_tokens: 正文输出上限
+        today: 当前日期（ISO date）。**必须给**——观察只有日期，没有"现在"这个锚，
+            模型就无法判断"这条是否已经过时"、"下周考试"是哪一周
         previous_profile_text: 仅在原料被截断时提供——上一版画像覆盖了更早的原料
     """
     if previous_profile_text:
@@ -106,8 +109,8 @@ def profile_prompt(
     # 于是整段模板的 4 空格缩进全部残留进提示词（`utils/summarizer.py` 就是这个形状）。
     template = c("""
     你是长期记忆的压缩器。下面是从一个用户的对话里逐条抽取出来的观察（explicit
-    observations），按时间从早到晚排列。请把它们压成一份**长期印象**，
-    供助理在往后的对话里反复当作背景使用。
+    observations），按时间从早到晚排列。**今天是 {today}。**
+    请把它们压成一份**长期印象**，供助理在往后的对话里反复当作背景使用。
 
     {carry_section}
 
@@ -119,12 +122,15 @@ def profile_prompt(
     3. **合并重复与同类项**，但**不要丢掉少数派信息**——只出现一次的事实往往最有用。
     4. 随时间变化的（换了工作、兴趣变了、关系变了）要写出**变化的方向和先后**，
        不要取平均、不要写成"有时 A 有时 B"。
-    5. **每条观察都要有归宿。** 与某一节契合的写进那一节；长期成立、
+    5. **用「今天」判断时效。** 已经过期的事（"下周考试"而那天早过了、早就换掉的工作）
+       要么别写，要么写成已发生的历史；只有仍然成立的才写成现在的状况。
+       「待跟进」一节尤其如此——已经了结的不要再挂着。
+    6. **每条观察都要有归宿。** 与某一节契合的写进那一节；长期成立、
        但哪一节都不太契合的（过敏、忌口、硬性约束、忌称……）**一律写进「固定事实」**。
        **绝对不许因为"分节不合适"就把事实丢掉**——篇幅不够时用「（暂无）」占位。
        只有一次性的、以后不会再有用的内容才可以不要。
-    6. 用**观察本身的语言**输出（观察是中文就写中文）。
-    7. 输出就是画像正文本身——不要前言、不要解释、不要元评论、不要复述这些要求。
+    7. 用**观察本身的语言**输出（观察是中文就写中文）。
+    8. 输出就是画像正文本身——不要前言、不要解释、不要元评论、不要复述这些要求。
 
     固定分节（按此顺序，节标题原样使用）：
 
@@ -138,6 +144,7 @@ def profile_prompt(
     """)
 
     return template.format(
+        today=today,
         carry_section=carry_section,
         section_spec=_format_section_spec(),
         observation_count=observation_count,
@@ -243,6 +250,9 @@ async def compress_profile(
         _format_observations(observations),
         observation_count=len(observations),
         max_tokens=settings.PROFILE.MAX_TOKENS,
+        # 观察只带日期，没有"现在"这个锚模型就判不了时效（见 profile_prompt 的 docstring）。
+        # 用 UTC 日期：观察日期本身就是 UTC（format_datetime_utc），保持一致免得差一天。
+        today=utc_now_iso()[:10],
         previous_profile_text=previous.text if previous else None,
     )
 
