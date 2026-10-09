@@ -1,10 +1,12 @@
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator
 
 from src import models
+from src.config import settings
 from src.utils.formatting import parse_datetime_iso
 
 # Conclusion levels whose `session_name` stamp is trustworthy enough to scope on.
@@ -42,6 +44,77 @@ def _strip_microseconds_and_timezone(timestamp: datetime) -> datetime:
     Remove microseconds and timezone info from a datetime for stable string formatting.
     """
     return timestamp.replace(microsecond=0, tzinfo=None)
+
+
+# `compact` drops the year and the seconds. Measured on the reference deployment's
+# real representation (87 explicit observations, ~4,000 content tokens): the old
+# `[YYYY-MM-DD HH:MM:SS]` UTC prefix cost 1,218 tokens (30.5% of the content), while
+# `[MM-DD HH:MM]` in the participants' own zone costs 783 (19.6%) — a 36% cut that
+# keeps time-of-day, which is what "the group is up at 4am" reasoning actually needs.
+_TIMESTAMP_FORMATS: dict[str, str] = {
+    "compact": "%m-%d %H:%M",
+    "full": "%Y-%m-%d %H:%M",
+    "date": "%Y-%m-%d",
+}
+
+
+def format_timestamp(timestamp: datetime) -> str:
+    """Render an observation timestamp for prompts (no brackets), per settings.
+
+    Observation timestamps reach us **naive** — `_safe_datetime_from_metadata` strips
+    the tzinfo — so a naive value is read as UTC and then converted. Getting this wrong
+    is the bug this replaces: the old rendering printed UTC unmarked while the
+    observation body usually repeated the same moment in the author's own zone, so the
+    two disagreed by the zone offset (8 hours here).
+    """
+    if settings.REPRESENTATION.TIMESTAMP_FORMAT == "none":
+        return ""
+    aware = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+    try:
+        local = aware.astimezone(ZoneInfo(settings.REPRESENTATION.TIMEZONE))
+    except Exception:  # pragma: no cover - TIMEZONE is validated at startup
+        local = aware.astimezone(timezone.utc)
+    fmt = _TIMESTAMP_FORMATS.get(
+        settings.REPRESENTATION.TIMESTAMP_FORMAT, _TIMESTAMP_FORMATS["compact"]
+    )
+    return local.strftime(fmt)
+
+
+def time_note() -> str:
+    """A one-off note stating which zone observation times are in.
+
+    Cheaper than a per-line zone marker: measured 1 token once, versus ~2 tokens on
+    every one of 87 lines.
+    """
+    if settings.REPRESENTATION.TIMESTAMP_FORMAT == "none":
+        return ""
+    return f" — times in {settings.REPRESENTATION.TIMEZONE}"
+
+
+def render_observation(
+    *,
+    created_at: datetime,
+    body: str,
+    session_name: str | None = None,
+    include_id: bool = False,
+    observation_id: str = "",
+    include_session: bool = False,
+) -> str:
+    """Shared line renderer for all four observation levels.
+
+    ``[MM-DD HH:MM] [group_1] body`` — the session appears only when asked for, and the
+    caller asks only when the representation actually spans several sessions.
+    """
+    fields: list[str] = []
+    if include_id and observation_id:
+        fields.append(f"id:{observation_id}")
+    formatted_time = format_timestamp(created_at)
+    if formatted_time:
+        fields.append(formatted_time)
+    if include_session and session_name:
+        fields.append(session_name)
+    prefix = f"[{' · '.join(fields)}] " if fields else ""
+    return f"{prefix}{body}"
 
 
 def flatten_message_ids(
@@ -159,13 +232,22 @@ class PromptRepresentation(BaseModel):
 class ExplicitObservation(ExplicitObservationBase, ObservationMetadata):
     """Explicit observation with content and metadata."""
 
+    def render(self, *, include_id: bool = False, include_session: bool = False) -> str:
+        return render_observation(
+            created_at=self.created_at,
+            body=self.content,
+            session_name=self.session_name,
+            include_id=include_id,
+            observation_id=self.id,
+            include_session=include_session,
+        )
+
     def __str__(self) -> str:
-        return f"[{_strip_microseconds_and_timezone(self.created_at)}] {self.content}"
+        return self.render()
 
     def str_with_id(self) -> str:
         """Format with ID prefix for use by agents that need to reference observations."""
-        id_prefix = f"[id:{self.id}] " if self.id else ""
-        return f"{id_prefix}[{_strip_microseconds_and_timezone(self.created_at)}] {self.content}"
+        return self.render(include_id=True)
 
     def __hash__(self) -> int:
         """
@@ -190,15 +272,24 @@ class ExplicitObservation(ExplicitObservationBase, ObservationMetadata):
 class DeductiveObservation(DeductiveObservationBase, ObservationMetadata):
     """Deductive observation with multiple premises and one conclusion, plus metadata."""
 
-    def __str__(self) -> str:
+    def render(self, *, include_id: bool = False, include_session: bool = False) -> str:
         premises_text = "\n".join(f"    - {premise}" for premise in self.premises)
-        return f"[{_strip_microseconds_and_timezone(self.created_at)}] {self.conclusion}\n{premises_text}"
+        head = render_observation(
+            created_at=self.created_at,
+            body=self.conclusion,
+            session_name=self.session_name,
+            include_id=include_id,
+            observation_id=self.id,
+            include_session=include_session,
+        )
+        return f"{head}\n{premises_text}"
+
+    def __str__(self) -> str:
+        return self.render()
 
     def str_with_id(self) -> str:
         """Format with ID prefix for use by agents that need to reference observations."""
-        id_prefix = f"[id:{self.id}] " if self.id else ""
-        premises_text = "\n".join(f"    - {premise}" for premise in self.premises)
-        return f"{id_prefix}[{_strip_microseconds_and_timezone(self.created_at)}] {self.conclusion}\n{premises_text}"
+        return self.render(include_id=True)
 
     def str_no_timestamps(self) -> str:
         premises_text = "\n".join(f"    - {premise}" for premise in self.premises)
@@ -227,21 +318,27 @@ class DeductiveObservation(DeductiveObservationBase, ObservationMetadata):
 class InductiveObservation(InductiveObservationBase, ObservationMetadata):
     """Inductive observation with sources, pattern type, and confidence, plus metadata."""
 
-    def __str__(self) -> str:
+    def render(self, *, include_id: bool = False, include_session: bool = False) -> str:
         sources_text = ""
         if self.sources:
             source_lines = [f"    - {source}" for source in self.sources]
             sources_text = "\n" + "\n".join(source_lines)
-        return f"[{_strip_microseconds_and_timezone(self.created_at)}] [{self.confidence}] {self.conclusion}{sources_text}"
+        head = render_observation(
+            created_at=self.created_at,
+            body=f"[{self.confidence}] {self.conclusion}",
+            session_name=self.session_name,
+            include_id=include_id,
+            observation_id=self.id,
+            include_session=include_session,
+        )
+        return f"{head}{sources_text}"
+
+    def __str__(self) -> str:
+        return self.render()
 
     def str_with_id(self) -> str:
         """Format with ID prefix for use by agents that need to reference observations."""
-        id_prefix = f"[id:{self.id}] " if self.id else ""
-        sources_text = ""
-        if self.sources:
-            source_lines = [f"    - {source}" for source in self.sources]
-            sources_text = "\n" + "\n".join(source_lines)
-        return f"{id_prefix}[{_strip_microseconds_and_timezone(self.created_at)}] [{self.confidence}] {self.conclusion}{sources_text}"
+        return self.render(include_id=True)
 
     def str_no_timestamps(self) -> str:
         sources_text = ""
@@ -268,21 +365,27 @@ class InductiveObservation(InductiveObservationBase, ObservationMetadata):
 class ContradictionObservation(ContradictionObservationBase, ObservationMetadata):
     """Contradiction observation - notes when user has made conflicting statements, plus metadata."""
 
-    def __str__(self) -> str:
+    def render(self, *, include_id: bool = False, include_session: bool = False) -> str:
         sources_text = ""
         if self.sources:
             source_lines = [f"    - {source}" for source in self.sources]
             sources_text = "\n" + "\n".join(source_lines)
-        return f"[{_strip_microseconds_and_timezone(self.created_at)}] CONTRADICTION: {self.content}{sources_text}"
+        head = render_observation(
+            created_at=self.created_at,
+            body=f"CONTRADICTION: {self.content}",
+            session_name=self.session_name,
+            include_id=include_id,
+            observation_id=self.id,
+            include_session=include_session,
+        )
+        return f"{head}{sources_text}"
+
+    def __str__(self) -> str:
+        return self.render()
 
     def str_with_id(self) -> str:
         """Format with ID prefix for use by agents that need to reference observations."""
-        id_prefix = f"[id:{self.id}] " if self.id else ""
-        sources_text = ""
-        if self.sources:
-            source_lines = [f"    - {source}" for source in self.sources]
-            sources_text = "\n" + "\n".join(source_lines)
-        return f"{id_prefix}[{_strip_microseconds_and_timezone(self.created_at)}] CONTRADICTION: {self.content}{sources_text}"
+        return self.render(include_id=True)
 
     def str_no_timestamps(self) -> str:
         sources_text = ""
@@ -406,45 +509,73 @@ class Representation(BaseModel):
             self.inductive = self.inductive[-max_observations:]
             self.contradiction = self.contradiction[-max_observations:]
 
+    def _sessions_spanned(self) -> int:
+        """How many distinct sessions contributed to this representation."""
+        return len(
+            {
+                obs.session_name
+                for obs in (
+                    self.explicit + self.deductive + self.inductive + self.contradiction
+                )
+                if obs.session_name
+            }
+        )
+
+    def needs_session_labels(self) -> bool:
+        """Whether lines should carry their session of origin.
+
+        Only when the representation actually mixes sessions, and only when enabled: a
+        single-session view (the common case, and the only one `limit_to_session=true`
+        produces) gains nothing from a label it would repeat on every line. Measured cost
+        when it does apply: ~5 tokens per explicit line, i.e. ~11% of the content — paid
+        only for the case where provenance is the difference between a usable and a
+        misleading fact set.
+        """
+        return (
+            settings.REPRESENTATION.INCLUDE_SESSION_PROVENANCE
+            and self._sessions_spanned() > 1
+        )
+
     def __str__(self) -> str:
         """
         Format representation into a clean, readable string for LLM prompts.
-        NOTE: we always strip subsecond precision from the timestamps.
+        NOTE: timestamps are rendered by `format_timestamp` (configured zone + format).
 
         Returns:
             Formatted string with clear sections and bullet points including temporal metadata
             Example:
             EXPLICIT:
-            1. [2025-01-01 12:00:00] The user has a dog named Rover
-            2. [2025-01-01 12:01:00] The user's dog is 5 years old
-            3. [2025-01-01 12:05:00] The user is 25 years old
+            1. [01-01 12:00] The user has a dog named Rover
+            2. [01-01 12:01] The user's dog is 5 years old
+            3. [01-01 12:05] The user is 25 years old
             DEDUCTIVE:
-            1. [2025-01-01 12:01:00] Rover is 5 years old
+            1. [01-01 12:01] Rover is 5 years old
                 - The user has a dog named Rover
                 - The user's dog is 5 years old
 
         """
 
         parts: list[str] = []
+        include_session = self.needs_session_labels()
 
         parts.append("EXPLICIT:\n")
         for i, observation in enumerate(self.explicit, 1):
-            parts.append(f"{i}. {observation}")
+            parts.append(f"{i}. {observation.render(include_session=include_session)}")
         parts.append("")
 
         parts.append("DEDUCTIVE:\n")
         for i, observation in enumerate(self.deductive, 1):
-            parts.append(f"{i}. {observation}")
+            parts.append(f"{i}. {observation.render(include_session=include_session)}")
         parts.append("")
 
         parts.append("INDUCTIVE:\n")
         for i, observation in enumerate(self.inductive, 1):
-            parts.append(f"{i}. {observation}")
+            parts.append(f"{i}. {observation.render(include_session=include_session)}")
         parts.append("")
 
         parts.append("CONTRADICTION:\n")
         for i, observation in enumerate(self.contradiction, 1):
-            parts.append(f"{i}. {observation}")
+            parts.append(f"{i}. {observation.render(include_session=include_session)}")
         parts.append("")
 
         return "\n".join(parts)
@@ -457,37 +588,46 @@ class Representation(BaseModel):
             Formatted string with IDs included
             Example:
             EXPLICIT:
-            1. [id:abc123] [2025-01-01 12:00:00] The user has a dog named Rover
-            2. [id:def456] [2025-01-01 12:01:00] The user's dog is 5 years old
+            1. [id:abc123 · 01-01 12:00] The user has a dog named Rover
+            2. [id:def456 · 01-01 12:01] The user's dog is 5 years old
             DEDUCTIVE:
-            1. [id:ghi789] [2025-01-01 12:01:00] Rover is 5 years old
+            1. [id:ghi789 · 01-01 12:01] Rover is 5 years old
                 - The user has a dog named Rover
                 - The user's dog is 5 years old
             INDUCTIVE:
-            1. [id:jkl012] [2025-01-01 12:05:00] [high] User tends to be methodical
+            1. [id:jkl012 · 01-01 12:05] [high] User tends to be methodical
                 - id:abc123
                 - id:def456
         """
         parts: list[str] = []
+        include_session = self.needs_session_labels()
 
         parts.append("EXPLICIT:\n")
         for i, observation in enumerate(self.explicit, 1):
-            parts.append(f"{i}. {observation.str_with_id()}")
+            parts.append(
+                f"{i}. {observation.render(include_id=True, include_session=include_session)}"
+            )
         parts.append("")
 
         parts.append("DEDUCTIVE:\n")
         for i, observation in enumerate(self.deductive, 1):
-            parts.append(f"{i}. {observation.str_with_id()}")
+            parts.append(
+                f"{i}. {observation.render(include_id=True, include_session=include_session)}"
+            )
         parts.append("")
 
         parts.append("INDUCTIVE:\n")
         for i, observation in enumerate(self.inductive, 1):
-            parts.append(f"{i}. {observation.str_with_id()}")
+            parts.append(
+                f"{i}. {observation.render(include_id=True, include_session=include_session)}"
+            )
         parts.append("")
 
         parts.append("CONTRADICTION:\n")
         for i, observation in enumerate(self.contradiction, 1):
-            parts.append(f"{i}. {observation.str_with_id()}")
+            parts.append(
+                f"{i}. {observation.render(include_id=True, include_session=include_session)}"
+            )
         parts.append("")
 
         return "\n".join(parts)
@@ -540,7 +680,11 @@ class Representation(BaseModel):
     def format_as_markdown(self, include_ids: bool = False) -> str:
         """
         Format a Representation object as markdown.
-        NOTE: we always strip subsecond precision from the timestamps.
+
+        Timestamps come from `format_timestamp` (zone and shape from
+        `settings.REPRESENTATION`). Session-of-origin labels appear only when the
+        representation actually spans more than one session — a single-session view
+        gains nothing from a label it would repeat on every line.
 
         Args:
             include_ids: If True, include observation IDs for use with get_reasoning_chain
@@ -550,23 +694,30 @@ class Representation(BaseModel):
         """
 
         parts: list[str] = []
+        include_session = self.needs_session_labels()
+        note = time_note()
 
         # Add explicit observations
         if self.explicit:
-            parts.append("## Explicit Observations\n")
+            parts.append(f"## Explicit Observations{note}\n")
             for obs in self.explicit:
                 # Don't need IDs for explicit as these are the lowest level of reasoning.
-                # id_prefix = f"[id:{obs.id}] " if include_ids and obs.id else ""
-                parts.append(f"{obs}")
+                parts.append(f"{obs.render(include_session=include_session)}")
             parts.append("")
 
         # Add deductive observations
         if self.deductive:
-            parts.append("## Deductive Observations\n")
+            parts.append(f"## Deductive Observations{note}\n")
             for obs in self.deductive:
-                id_prefix = f"[id:{obs.id}] " if include_ids and obs.id else ""
-                timestamp = _strip_microseconds_and_timezone(obs.created_at)
-                parts.append(f"{id_prefix}[{timestamp}] {obs.conclusion}")
+                head = render_observation(
+                    created_at=obs.created_at,
+                    body=obs.conclusion,
+                    session_name=obs.session_name,
+                    include_id=include_ids,
+                    observation_id=obs.id,
+                    include_session=include_session,
+                )
+                parts.append(head)
                 if obs.premises:
                     parts.append("   Premises:")
                     for premise in obs.premises:
@@ -576,11 +727,19 @@ class Representation(BaseModel):
 
         # Add inductive observations
         if self.inductive:
-            parts.append("## Inductive Observations\n")
+            parts.append(f"## Inductive Observations{note}\n")
             for obs in self.inductive:
-                id_prefix = f"[id:{obs.id}] " if include_ids and obs.id else ""
+                fields: list[str] = []
+                if include_ids and obs.id:
+                    fields.append(f"id:{obs.id}")
+                formatted_time = format_timestamp(obs.created_at)
+                if formatted_time:
+                    fields.append(formatted_time)
+                if include_session and obs.session_name:
+                    fields.append(obs.session_name)
+                prefix = f"[{' · '.join(fields)}] " if fields else ""
                 parts.append(
-                    f"{id_prefix} **Pattern** [{obs.confidence}]: {obs.conclusion}"
+                    f"{prefix} **Pattern** [{obs.confidence}]: {obs.conclusion}"
                 )
                 if obs.pattern_type:
                     parts.append(f"   **Type**: {obs.pattern_type}")
@@ -595,10 +754,18 @@ class Representation(BaseModel):
 
         # Add contradiction observations
         if self.contradiction:
-            parts.append("## Contradictions\n")
+            parts.append(f"## Contradictions{note}\n")
             for obs in self.contradiction:
-                id_prefix = f"[id:{obs.id}] " if include_ids and obs.id else ""
-                parts.append(f"{id_prefix} **CONTRADICTION**: {obs.content}")
+                fields = []
+                if include_ids and obs.id:
+                    fields.append(f"id:{obs.id}")
+                formatted_time = format_timestamp(obs.created_at)
+                if formatted_time:
+                    fields.append(formatted_time)
+                if include_session and obs.session_name:
+                    fields.append(obs.session_name)
+                prefix = f"[{' · '.join(fields)}] " if fields else ""
+                parts.append(f"{prefix} **CONTRADICTION**: {obs.content}")
                 if obs.sources:
                     parts.append("   **Conflicting statements**:")
                     for source in obs.sources:

@@ -1326,6 +1326,43 @@ class SessionProfileSettings(HonchoSettings):
     ADMINS_METADATA_KEY: str = "admins"
 
 
+class RepresentationSettings(HonchoSettings):
+    """How observations are rendered into prompts.
+
+    Two measured problems motivated this (doc/memory_layer_decision.md §22.3, §26):
+
+    1. **Timestamps were UTC with no marker**, while the observation text usually repeats
+       the time in the author's own zone. On the reference deployment 23% of explicit
+       tokens were timestamps and 92/100 of those lines carried local time in the body
+       too — disagreeing with the prefix by 8 hours.
+    2. **`session_name` was never rendered**, so a peer's cross-session representation
+       (six groups, measured) presented facts with no provenance at all.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="REPRESENTATION_", extra="ignore")  # pyright: ignore
+
+    # Zone the timestamps are rendered in. Should be the zone the participants actually
+    # live in — otherwise the model reasons about "how long ago" wrongly.
+    TIMEZONE: str = "UTC"
+
+    @field_validator("TIMEZONE")
+    @classmethod
+    def _valid_timezone(cls, value: str) -> str:
+        ZoneInfo(value)  # raises ZoneInfoNotFoundError for an unknown name
+        return value
+
+    # compact = "MM-DD HH:MM" (default), full = "YYYY-MM-DD HH:MM",
+    # date = "YYYY-MM-DD", none = no timestamp at all.
+    # `compact` drops the year and the seconds: measured on real data that is 36% fewer
+    # timestamp tokens than the old UTC-with-seconds form, while keeping time-of-day
+    # (which carries real signal — "the group is up at 4am").
+    TIMESTAMP_FORMAT: Literal["compact", "full", "date", "none"] = "compact"
+
+    # Render each observation's session of origin — but only when the representation
+    # actually spans more than one session, so the common case pays nothing.
+    INCLUDE_SESSION_PROVENANCE: bool = True
+
+
 class WebhookSettings(HonchoSettings):
     model_config = SettingsConfigDict(env_prefix="WEBHOOK_", extra="ignore")  # pyright: ignore
 
@@ -1709,6 +1746,9 @@ class AppSettings(HonchoSettings):
     PROFILE: ProfileSettings = Field(default_factory=ProfileSettings)
     SESSION_PROFILE: SessionProfileSettings = Field(
         default_factory=SessionProfileSettings
+    )
+    REPRESENTATION: RepresentationSettings = Field(
+        default_factory=RepresentationSettings
     )
     WEBHOOK: WebhookSettings = Field(default_factory=WebhookSettings)
     METRICS: MetricsSettings = Field(default_factory=MetricsSettings)
