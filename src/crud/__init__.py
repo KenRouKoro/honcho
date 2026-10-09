@@ -8,6 +8,12 @@ from .deriver import (
     get_deriver_status,
     get_queue_status,
 )
+from .display_name import (
+    DISPLAY_NAME_KEY,
+    get_session_display_names,
+    record_session_display_names,
+    short_peer_id,
+)
 from .document import (
     CreateDocumentsResult,
     create_documents,
@@ -200,6 +206,11 @@ __all__ = [
     "SESSION_PROFILE_LABEL",
     "get_session_profile",
     "set_session_profile",
+    # 群名片（per-session display name）
+    "DISPLAY_NAME_KEY",
+    "get_session_display_names",
+    "record_session_display_names",
+    "short_peer_id",
     "get_session_stats",
     "stats_block",
     # Webhook

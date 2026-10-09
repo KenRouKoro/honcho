@@ -1318,6 +1318,10 @@ class SessionProfileSettings(HonchoSettings):
     # 从未发言的人只由名册给出计数（§23.4、§23.5）。
     REGULAR_MIN_MESSAGES: Annotated[int, Field(default=50, gt=0, le=100_000)] = 50
 
+    # 统计里附带多少个"发言最多的人"（含群名片）。刻意有界：这是样本不是名册，
+    # 目的是让描述里能写"小白"而不是 `user_123456789012`（§27）。0 = 不带。
+    TOP_SPEAKERS: Annotated[int, Field(default=10, ge=0, le=100)] = 10
+
     # 名册总数、群名等由客户端写进 `Session.metadata`；这里声明键名，
     # 免得 Honcho 侧硬编码字符串（契约见 doc/memory_layer_decision.md §23.6）。
     MEMBER_COUNT_METADATA_KEY: str = "member_count"

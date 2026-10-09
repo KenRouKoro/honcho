@@ -27,7 +27,7 @@ from src.telemetry.prometheus.metrics import (
 )
 from src.telemetry.sentry import with_sentry_transaction
 from src.utils.config_helpers import get_configuration
-from src.utils.formatting import format_new_turn_with_timestamp
+from src.utils.formatting import format_new_turn_with_timestamp, utc_now_iso
 from src.utils.representation import PromptRepresentation, Representation
 from src.utils.retryable_errors import is_retryable_error
 from src.utils.tokens import track_deriver_input_tokens
@@ -35,6 +35,33 @@ from src.utils.tokens import track_deriver_input_tokens
 from .prompts import estimate_deriver_prompt_tokens, minimal_deriver_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def speaker_label(peer_name: str, display_name: str | None) -> str:
+    """``("user_123456789012", "小白")`` → ``"小白(123456789012)"``.
+
+    Falls back to the bare peer id when no card was observed, so a session that never
+    supplied one degrades to the previous behaviour rather than to something ambiguous.
+    """
+    cleaned = (display_name or "").strip()
+    if not cleaned:
+        return peer_name
+    return f"{cleaned}({crud.short_peer_id(peer_name)})"
+
+
+def observed_display_names(messages: list[Message]) -> dict[str, str]:
+    """Latest non-empty ``metadata.user_name`` per speaker, in message order.
+
+    `user_name` is the *group card* — the bridge puts it there on every message — so
+    this is a per-session name by construction, no extra storage or roster fetch needed.
+    Last write wins within the batch: a card changed mid-batch resolves to the newest.
+    """
+    names: dict[str, str] = {}
+    for message in messages:
+        raw = (message.h_metadata or {}).get("user_name")
+        if isinstance(raw, str) and raw.strip():
+            names[message.peer_name] = raw.strip()
+    return names
 
 
 def _get_deriver_model_config() -> ConfiguredModelSettings:
@@ -109,11 +136,48 @@ async def process_representation_tasks_batch(
         "id",
     )
 
-    # Format messages with timestamps
+    # Format messages with timestamps.
+    #
+    # Speakers are labelled with the name the messages themselves carry
+    # (`metadata.user_name`, which the bridge fills with the *group card*) plus the
+    # stable id in parentheses. Without this the model saw `user_123456789012: …` for the
+    # subject while mentioned others appeared by name (from QQ's at/reply rendering) —
+    # two identity notations in the same sentence, and the subject — the only one the
+    # model has to reason *about* — was the unreadable one.
+    # See doc/memory_layer_decision.md §27.
+    display_names = observed_display_names(messages)
     formatted_messages = "\n".join(
-        format_new_turn_with_timestamp(msg.content, msg.created_at, msg.peer_name)
+        format_new_turn_with_timestamp(
+            msg.content,
+            msg.created_at,
+            speaker_label(msg.peer_name, display_names.get(msg.peer_name)),
+        )
         for msg in messages
     )
+
+    # Persist the cards we just observed into `session_peers.internal_metadata`, which is
+    # the per-(session, peer) home they never had. Written here rather than by the client
+    # because the data already rides along with every message, and because a card that
+    # changed must not overwrite the *global* nickname (`Peer.h_metadata.name`) — one
+    # group's card would clobber another's. Best-effort: bookkeeping must never fail
+    # ingestion. See doc/memory_layer_decision.md §27.
+    if display_names:
+        try:
+            async with tracked_db("minimal_deriver.display_names") as db:
+                await crud.record_session_display_names(
+                    db,
+                    latest_message.workspace_name,
+                    session_name=latest_message.session_name,
+                    names=display_names,
+                    seen_at=utc_now_iso(),
+                )
+        except Exception:
+            logger.warning(
+                "Failed to record display names for %s/%s",
+                latest_message.workspace_name,
+                latest_message.session_name,
+                exc_info=True,
+            )
 
     # Track token usage - count only tokens from messages being processed
     prompt_tokens = estimate_deriver_prompt_tokens(custom_instructions)
@@ -134,6 +198,7 @@ async def process_representation_tasks_batch(
         peer_id=observed,
         messages=formatted_messages,
         custom_instructions=custom_instructions,
+        display_name=display_names.get(observed),
     )
 
     context_prep_duration = (time.perf_counter() - overall_start) * 1000

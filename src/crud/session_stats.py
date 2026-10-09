@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models, schemas
 from src.config import settings
+from src.crud.display_name import get_session_display_names, short_peer_id
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,24 @@ async def get_session_stats(
     regular = sum(1 for _, n in rows if n >= threshold)
     occasional = len(rows) - regular
 
+    # Bounded sample of the loudest participants, with their group cards. This is what
+    # lets a session description (and any caller) say "小白" instead of
+    # "user_123456789012" without shipping a 157-entry roster. §27.
+    top_n = settings.SESSION_PROFILE.TOP_SPEAKERS
+    loudest = sorted(rows, key=lambda r: (-r[1], r[0]))[:top_n] if top_n > 0 else []
+    names = await get_session_display_names(
+        db,
+        workspace_name,
+        session_name=session_name,
+        peers=[peer for peer, _ in loudest],
+    )
+    top_speakers = [
+        schemas.SessionSpeaker(
+            peer_name=peer, display_name=names.get(peer), message_count=n
+        )
+        for peer, n in loudest
+    ]
+
     metadata: dict[str, Any] = session.h_metadata or {}
     cfg = settings.SESSION_PROFILE
     member_count = _as_int(metadata.get(cfg.MEMBER_COUNT_METADATA_KEY))
@@ -92,6 +111,7 @@ async def get_session_stats(
         occasional_count=occasional,
         lurker_count=lurker_count,
         regular_min_messages=threshold,
+        top_speakers=top_speakers,
     )
 
 
@@ -117,6 +137,16 @@ def stats_block(stats: schemas.SessionStats) -> str:
             lines.append(f"  - 人数上限：{stats.max_member_count}")
     if stats.admins:
         lines.append(f"管理员：{', '.join(stats.admins)}")
+    if stats.top_speakers:
+        lines.append(
+            "发言最多的人（名字(稳定id)：条数）"
+            + "——**提到这些人时用这个名字，不要用 id**："
+        )
+        for speaker in stats.top_speakers:
+            label = f"{speaker.display_name}({short_peer_id(speaker.peer_name)})"
+            if speaker.display_name is None:
+                label = f"{speaker.peer_name}（本群名未知）"
+            lines.append(f"  - {label}：{speaker.message_count} 条")
     lines.append("</session_stats>")
     return "\n".join(lines)
 

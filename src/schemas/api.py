@@ -559,6 +559,21 @@ class SessionProfile(BaseModel):
     )
 
 
+class SessionSpeaker(BaseModel):
+    """One participant of a session, as the session itself sees them.
+
+    ``peer_name`` stays the stable key; ``display_name`` is the **group card** — the
+    name used inside *this* group, which is per-session by nature and changes often
+    (doc/memory_layer_decision.md §27).
+    """
+
+    peer_name: str = Field(description="Stable peer id")
+    display_name: str | None = Field(
+        default=None, description="The group card observed for this session, if any"
+    )
+    message_count: int = Field(default=0, description="Messages sent in this session")
+
+
 class SessionStats(BaseModel):
     """零 LLM 的场地统计——每次请求实时算，永远新鲜。
 
@@ -583,6 +598,13 @@ class SessionStats(BaseModel):
         default=None, description="纯潜水（从未发言）；名册未知时 None"
     )
     regular_min_messages: int = Field(default=0, description="判定「常驻」的消息数门槛")
+    top_speakers: list[SessionSpeaker] = Field(
+        default_factory=list,
+        description=(
+            "Highest-volume participants with their group cards, so a caller can render "
+            "names instead of opaque peer ids. Bounded — a sample, not the roster."
+        ),
+    )
 
 
 class SessionContext(SessionBase):
