@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import time
 import uuid
@@ -151,11 +152,27 @@ async def lifespan(_: FastAPI):
     except Exception as e:
         logger.error("Failed to start backlog metrics poller: %s", e)
 
+    # 内嵌 deriver：单进程模式下 API 与队列消费者共用一个事件循环。
+    # 见 src/deriver/runner.py 的说明。FOXBOT_EMBED_DERIVER=0 可关闭（调测）。
+    embed_deriver = os.getenv("FOXBOT_EMBED_DERIVER", "1").strip() != "0"
+    if embed_deriver:
+        from src.deriver import runner as deriver_runner
+
+        deriver_runner.start()
+    else:
+        logger.info("内嵌 deriver 已禁用（FOXBOT_EMBED_DERIVER=0）")
+
     try:
         yield
     finally:
         # Import here to avoid circular import at module load time
         from src.vector_store import close_external_vector_store
+
+        # 顺序：先停 deriver（它还在用 engine），再关连接池与缓存
+        if embed_deriver:
+            from src.deriver import runner as deriver_runner
+
+            await deriver_runner.stop()
 
         await deriver_metrics_poller.shutdown()
         deriver_metrics.set_deriver_metrics_poller(None)

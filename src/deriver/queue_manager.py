@@ -209,26 +209,34 @@ class QueueManager:
         """Get the total number of work units owned by all workers"""
         return len(self.worker_ownership)
 
-    async def initialize(self) -> None:
-        """Setup signal handlers, initialize client, and start the main polling loop"""
+    async def initialize(self, *, install_signal_handlers: bool = True) -> None:
+        """Setup signal handlers, initialize client, and start the main polling loop.
+
+        ``install_signal_handlers=False`` 用于**内嵌进 API 进程**的场景
+        （见 ``src/deriver/runner.py``）：此时 uvicorn 拥有 SIGTERM/SIGINT，
+        本类再注册会与之互抢，导致关不干净。
+        """
         logger.debug(f"Initializing QueueManager with {self.workers} workers")
 
         # Set up signal handlers (add_signal_handler is Unix-only)
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(
-                    sig, lambda s=sig: asyncio.create_task(self.shutdown(s))
-                )
-            except NotImplementedError:
-                # Windows: fall back to signal.signal + call_soon_threadsafe
-                signal.signal(
-                    sig,
-                    lambda s, _f, sig=sig: loop.call_soon_threadsafe(
-                        lambda sig=sig: asyncio.create_task(self.shutdown(sig))
-                    ),
-                )
-        logger.debug("Signal handlers registered")
+        if install_signal_handlers:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(
+                        sig, lambda s=sig: asyncio.create_task(self.shutdown(s))
+                    )
+                except NotImplementedError:
+                    # Windows: fall back to signal.signal + call_soon_threadsafe
+                    signal.signal(
+                        sig,
+                        lambda s, _f, sig=sig: loop.call_soon_threadsafe(
+                            lambda sig=sig: asyncio.create_task(self.shutdown(sig))
+                        ),
+                    )
+            logger.debug("Signal handlers registered")
+        else:
+            logger.debug("Signal handlers skipped (embedded mode)")
 
         # Start the reconciler scheduler
         try:
@@ -244,9 +252,15 @@ class QueueManager:
         finally:
             await self.cleanup()
 
-    async def shutdown(self, sig: signal.Signals) -> None:
-        """Handle graceful shutdown"""
-        logger.info(f"Received exit signal {sig.name}...")
+    async def shutdown(self, sig: signal.Signals | None = None) -> None:
+        """Handle graceful shutdown.
+
+        ``sig=None`` 表示由内嵌宿主（API lifespan）发起的关闭，不是信号触发。
+        """
+        if sig is None:
+            logger.info("Shutdown requested by host process...")
+        else:
+            logger.info(f"Received exit signal {sig.name}...")
         self.shutdown_event.set()
 
         # Cancel all pending dreams
