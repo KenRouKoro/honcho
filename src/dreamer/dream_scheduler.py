@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
 import random
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from logging import getLogger
-from zoneinfo import ZoneInfo
+from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import sentry_sdk
 from sqlalchemy import exists, func, select
@@ -30,6 +32,145 @@ def set_dream_scheduler(dream_scheduler: "DreamScheduler") -> None:
 def get_dream_scheduler() -> "DreamScheduler | None":
     """Get the global dream scheduler reference."""
     return _dream_scheduler
+
+
+@dataclass(frozen=True)
+class DreamWindow:
+    """The daily window a collection's dreams are allowed to fire in.
+
+    The window started as a process-wide setting, but "off-peak" is a property of the
+    *place*, not of the deployment: a night-shift group or an overseas group is quiet at
+    a different hour, and clamping everyone into `Asia/Shanghai 02:00–07:00` merely
+    moves their load into their busiest hour. So the window is now resolved per session
+    (from `Session.metadata`, §28.4) with the global setting as the default.
+    """
+
+    start_hour: int
+    end_hour: int
+    timezone: str
+    source: str = "global"
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
+
+
+def global_dream_window() -> DreamWindow | None:
+    """The process-wide window, or None when no window is configured."""
+    start = settings.DREAM.ALLOWED_WINDOW_START_HOUR
+    end = settings.DREAM.ALLOWED_WINDOW_END_HOUR
+    if start is None or end is None:
+        return None
+    return DreamWindow(
+        start_hour=start,
+        end_hour=end,
+        timezone=settings.DREAM.WINDOW_TIMEZONE,
+        source="global",
+    )
+
+
+def parse_session_dream_window(raw: Any) -> DreamWindow | None:
+    """``{"start_hour": 4, "end_hour": 9, "timezone": "Asia/Tokyo"}`` → DreamWindow.
+
+    Every key is optional *except* that both hours must be present together — half a
+    window is not a window, and silently borrowing the other half from the global
+    setting would produce a range nobody asked for. Anything malformed is ignored with
+    a debug log; a bad override must never stop dreams, only fail to improve them.
+    """
+    if not isinstance(raw, dict):
+        return None
+    data = cast(dict[str, Any], raw)
+
+    def _hour(key: str) -> int | None:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 <= value <= 23 else None
+
+    start = _hour("start_hour")
+    end = _hour("end_hour")
+    if start is None or end is None:
+        logger.debug("Ignoring incomplete session dream window: %r", raw)
+        return None
+
+    tz_raw = data.get("timezone")
+    tz_name = (
+        tz_raw.strip()
+        if isinstance(tz_raw, str) and tz_raw.strip()
+        else settings.DREAM.WINDOW_TIMEZONE
+    )
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning(
+            "Unknown timezone %r in session dream window; using %s",
+            tz_name,
+            settings.DREAM.WINDOW_TIMEZONE,
+        )
+        tz_name = settings.DREAM.WINDOW_TIMEZONE
+    return DreamWindow(
+        start_hour=start, end_hour=end, timezone=tz_name, source="session"
+    )
+
+
+def effective_dream_window(
+    session_metadata: dict[str, Any] | None,
+) -> DreamWindow | None:
+    """Session override if it has one, else the global window."""
+    override = parse_session_dream_window(
+        (session_metadata or {}).get(settings.DREAM.SESSION_WINDOW_METADATA_KEY)
+    )
+    return override or global_dream_window()
+
+
+async def resolve_dream_window(
+    db: AsyncSession, collection: models.Collection
+) -> DreamWindow | None:
+    """The window that applies to this collection, right now.
+
+    A collection is keyed by ``(observer, observed)`` and is **not** tied to one session:
+    the same pair can collect observations from several groups. The window still has to
+    come from somewhere, so this uses the same heuristic ``execute_dream`` already uses
+    to pick the session a dream belongs to — **the session of the newest explicit
+    observation**. That keeps the schedule-time and execute-time notions of "which place
+    is this dream about" identical, which matters because a mismatch would silently
+    apply one group's off-peak hours to another's dream.
+
+    Failures fall back to the global window rather than propagating: a dream that fires
+    at a slightly wrong hour is a cost problem, a dream that never fires is a memory
+    problem.
+    """
+    try:
+        session_name = await db.scalar(
+            select(models.Document.session_name)
+            .where(
+                models.Document.workspace_name == collection.workspace_name,
+                models.Document.observer == collection.observer,
+                models.Document.observed == collection.observed,
+                models.Document.level == "explicit",
+            )
+            .order_by(models.Document.created_at.desc(), models.Document.id.desc())
+            .limit(1)
+        )
+        if not session_name:
+            return global_dream_window()
+        metadata = await db.scalar(
+            select(models.Session.h_metadata).where(
+                models.Session.workspace_name == collection.workspace_name,
+                models.Session.name == session_name,
+            )
+        )
+    except Exception:  # pragma: no cover - defensive; scheduling must not break
+        logger.warning(
+            "Failed to resolve dream window for %s/%s/%s; using global window",
+            collection.workspace_name,
+            collection.observer,
+            collection.observed,
+            exc_info=True,
+        )
+        return global_dream_window()
+
+    return effective_dream_window(cast(dict[str, Any] | None, metadata or {}) or None)
 
 
 def clamp_wake_to_window(
@@ -122,12 +263,18 @@ class DreamScheduler:
         delay_reason: str | None = None,
         documents_since_last_dream_at_schedule: int | None = None,
         document_threshold: int | None = None,
+        window: DreamWindow | None = None,
     ) -> None:
         """Schedule a dream for a collection after a delay.
 
         telemetry kwargs are captured at schedule time and threaded
         through the queue payload so DreamRunEvent can attribute the dream
         back to its scheduling context.
+
+        ``window`` is the **already-resolved** window for this collection's session
+        (see ``resolve_dream_window``). Omitting it falls back to the global window, so
+        a direct caller keeps the previous behaviour; there is no way to ask for "no
+        window at all" other than leaving both global hours unset.
         """
         if not settings.DREAM.ENABLED:
             return
@@ -135,24 +282,24 @@ class DreamScheduler:
         # Cancel any existing dream for this collection
         await self.cancel_dream(work_unit_key)
 
-        window_start = settings.DREAM.ALLOWED_WINDOW_START_HOUR
-        window_end = settings.DREAM.ALLOWED_WINDOW_END_HOUR
-        if window_start is not None and window_end is not None:
-            tz = ZoneInfo(settings.DREAM.WINDOW_TIMEZONE)
+        window = window if window is not None else global_dream_window()
+        if window is not None:
+            tz = window.tz
             wake = datetime.now(UTC) + timedelta(minutes=delay_minutes)
-            clamped = clamp_wake_to_window(wake, window_start, window_end, tz)
+            clamped = clamp_wake_to_window(wake, window.start_hour, window.end_hour, tz)
             if clamped > wake:
                 # Without the jitter every deferred dream in the workspace wakes at the
                 # same instant (the window start). See `jitter_within_window`.
                 jittered = jitter_within_window(
                     clamped,
-                    end_hour=window_end,
+                    end_hour=window.end_hour,
                     tz=tz,
                     jitter_minutes=settings.DREAM.WINDOW_JITTER_MINUTES,
                 )
                 logger.info(
-                    "Deferring dream for %s into allowed window: %s -> %s",
+                    "Deferring dream for %s into allowed window (%s): %s -> %s",
                     work_unit_key,
+                    window.source,
                     wake.isoformat(),
                     jittered.isoformat(),
                 )
@@ -448,6 +595,11 @@ async def check_and_schedule_dream(
 
         dream_scheduler = get_dream_scheduler()
         if dream_scheduler:
+            # §28.4: resolve the window *here*, once, so every dream type of this
+            # collection is clamped by the same rule. Doing it lazily (only for the
+            # rare schedule that actually fires) keeps the two extra reads off the
+            # common path where the threshold has not been reached yet.
+            window = await resolve_dream_window(db, collection)
             for dream_type in enabled_dream_types:
                 dream_work_unit_key = construct_work_unit_key(
                     collection.workspace_name,
@@ -469,6 +621,7 @@ async def check_and_schedule_dream(
                     delay_reason=delay_reason,
                     documents_since_last_dream_at_schedule=documents_since_last_dream,
                     document_threshold=settings.DREAM.DOCUMENT_THRESHOLD,
+                    window=window,
                 )
                 logger.debug(
                     "Scheduled dream",
@@ -479,6 +632,7 @@ async def check_and_schedule_dream(
                         "documents_since_last_dream": documents_since_last_dream,
                         "document_threshold": settings.DREAM.DOCUMENT_THRESHOLD,
                         "dream_type": dream_type,
+                        "window_source": window.source if window else None,
                     },
                 )
             return True

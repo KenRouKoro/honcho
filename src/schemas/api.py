@@ -572,6 +572,21 @@ class SessionSpeaker(BaseModel):
         default=None, description="The group card observed for this session, if any"
     )
     message_count: int = Field(default=0, description="Messages sent in this session")
+    previous_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Group cards this member used **before** the current one, most recent first. "
+            "Observations written under an older name stay in memory forever, so this is "
+            "what lets a reader recognise 老白 and 小白 as the same person (§28.1)."
+        ),
+    )
+    title: str | None = Field(
+        default=None,
+        description="Group-specific honorific (platform MemberInfo.title), when the client supplied it",
+    )
+    role: str | None = Field(
+        default=None, description="owner / admin / member, when the client supplied it"
+    )
 
 
 class SessionStats(BaseModel):
@@ -587,8 +602,29 @@ class SessionStats(BaseModel):
     group_name: str | None = Field(default=None, description="群名/场地名（名册）")
     member_count: int | None = Field(default=None, description="名册总人数")
     max_member_count: int | None = Field(default=None, description="人数上限")
+    owner: str | None = Field(default=None, description="群主 peer 名（名册）")
     admins: list[str] = Field(
         default_factory=list, description="管理员 peer 名（名册）"
+    )
+    admin_details: list[SessionSpeaker] = Field(
+        default_factory=list,
+        description=(
+            "``admins`` 的富化形式（同序、同长度）：带上群名片、头衔与角色。"
+            "名册给的是裸 id，而描述里要写的是称呼——只给 id 等于让模型放弃引用这些人。"
+        ),
+    )
+    roster_synced_at: str | None = Field(
+        default=None, description="客户端上次拉名册的时刻（ISO 8601）；未知时 None"
+    )
+    roster_age_seconds: int | None = Field(
+        default=None, description="名册年龄（秒）；无同步时刻时 None"
+    )
+    roster_stale: bool | None = Field(
+        default=None,
+        description=(
+            "名册是否已超过 ``ROSTER_MAX_AGE_HOURS``。None = 客户端没给同步时刻，"
+            "即**未知**，而不是「新鲜」——两者在提示词里说法不同（§28.3）"
+        ),
     )
     message_count: int = Field(default=0, description="该 session 的消息总数")
     speaker_count: int = Field(default=0, description="说过话的人数")
@@ -603,6 +639,14 @@ class SessionStats(BaseModel):
         description=(
             "Highest-volume participants with their group cards, so a caller can render "
             "names instead of opaque peer ids. Bounded — a sample, not the roster."
+        ),
+    )
+    duplicate_display_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Group cards used by more than one member **in this session**. A name is not "
+            "an identity; when this is non-empty the reader must fall back to the id to "
+            "tell two people apart (§28.5). Bounded by the roster, usually empty."
         ),
     )
 

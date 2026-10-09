@@ -32,6 +32,7 @@ OBSERVATION_MUTATION_TOOLS = {
     "create_observations",
     "create_observations_deductive",
     "create_observations_inductive",
+    "create_observations_contradiction",
     "delete_observations",
 }
 

@@ -21,6 +21,7 @@ from src.utils.agent_tools import (
     ToolContext,
     _bounded_int,  # pyright: ignore[reportPrivateUsage]
     _handle_create_observations,  # pyright: ignore[reportPrivateUsage]
+    _handle_create_observations_contradiction,  # pyright: ignore[reportPrivateUsage]
     _handle_delete_observations,  # pyright: ignore[reportPrivateUsage]
     _handle_extract_preferences,  # pyright: ignore[reportPrivateUsage]
     _handle_finish_consolidation,  # pyright: ignore[reportPrivateUsage]
@@ -326,6 +327,92 @@ class TestCreateObservations:
         assert "ERROR" in result
         # Handlers may return ToolResult (); str() returns .content.
         assert "empty" in str(result).lower()
+
+    async def test_contradiction_tool_writes_a_contradiction_level_row(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """The write path `contradiction` never had (doc/memory_layer_decision.md §28.7).
+
+        Before this tool existed the level was unreachable: the deduction specialist's
+        only creation tool forced `level="deductive"`, so the whole workspace held zero
+        contradiction rows despite the prompt explicitly asking for them.
+        """
+        workspace, peer1, peer2, _session, _, _ = tool_test_data
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations_contradiction(
+            ctx,
+            {
+                "observations": [
+                    {
+                        "content": "Claims both to love and to hate coffee",
+                        "source_ids": ["obs_a", "obs_b"],
+                        "sources": ["I love coffee", "I hate coffee"],
+                    }
+                ]
+            },
+        )
+
+        assert "1 contradiction" in str(result)
+        doc = (
+            await db_session.execute(
+                select(models.Document).where(
+                    models.Document.workspace_name == workspace.name,
+                    models.Document.observer == peer1.name,
+                    models.Document.observed == peer2.name,
+                    models.Document.content == "Claims both to love and to hate coffee",
+                )
+            )
+        ).scalar_one()
+        assert doc.level == "contradiction"
+        assert doc.source_ids == ["obs_a", "obs_b"]
+        assert (doc.internal_metadata or {}).get("sources") == [
+            "I love coffee",
+            "I hate coffee",
+        ]
+
+    async def test_contradiction_tool_rejects_a_single_sided_conflict(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """One source is an assertion, not a conflict — the schema must refuse it."""
+        workspace, peer1, peer2, _session, _, _ = tool_test_data
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations_contradiction(
+            ctx,
+            {
+                "observations": [
+                    {
+                        "content": "Only one side given",
+                        "source_ids": ["obs_a"],
+                        "sources": ["I love coffee"],
+                    }
+                ]
+            },
+        )
+
+        assert "ERROR" in str(result)
+        stored = (
+            (
+                await db_session.execute(
+                    select(models.Document).where(
+                        models.Document.workspace_name == workspace.name,
+                        models.Document.observer == peer1.name,
+                        models.Document.observed == peer2.name,
+                        models.Document.content == "Only one side given",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert stored == []
 
     async def test_batch_embedding_failure_falls_back_to_individual_embeds(
         self,

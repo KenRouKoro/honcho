@@ -11,9 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import models
 from src.dreamer.dream_scheduler import (
     DreamScheduler,
+    DreamWindow,
     check_and_schedule_dream,
     clamp_wake_to_window,
+    effective_dream_window,
+    global_dream_window,
     jitter_within_window,
+    parse_session_dream_window,
+    resolve_dream_window,
     set_dream_scheduler,
 )
 from src.schemas import DreamType
@@ -616,6 +621,290 @@ class TestScheduleDreamWindowDeferral:
             )
 
         assert mock_delayed.call_args.args[2] == 60
+
+
+class TestSessionDreamWindow:
+    """`off-peak` is a property of the place, not of the process (§28.4).
+
+    The window used to be one global setting, so a night-shift or overseas group was
+    clamped into `Asia/Shanghai 02:00–07:00` — i.e. its *busiest* hour. A session may now
+    declare its own window in `Session.metadata`, and the global setting stays the
+    default. Everything malformed degrades to the global window: dreaming an hour late
+    is a cost problem, never dreaming is a memory problem.
+    """
+
+    def test_parse_valid_override(self):
+        window = parse_session_dream_window(
+            {"start_hour": 4, "end_hour": 9, "timezone": "Asia/Tokyo"}
+        )
+        assert window is not None
+        assert (window.start_hour, window.end_hour) == (4, 9)
+        assert window.timezone == "Asia/Tokyo"
+        assert window.source == "session"
+
+    def test_timezone_defaults_to_the_global_one(self):
+        with patch(
+            "src.dreamer.dream_scheduler.settings.DREAM.WINDOW_TIMEZONE",
+            "Asia/Shanghai",
+        ):
+            window = parse_session_dream_window({"start_hour": 1, "end_hour": 3})
+        assert window is not None and window.timezone == "Asia/Shanghai"
+
+    def test_half_a_window_is_not_a_window(self):
+        """Borrowing the missing half from the global setting would produce a range
+        nobody asked for, so an incomplete override is simply ignored."""
+        assert parse_session_dream_window({"start_hour": 4}) is None
+        assert parse_session_dream_window({"end_hour": 9}) is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            None,
+            "02:00-07:00",
+            ["start_hour", "end_hour"],
+            {"start_hour": 24, "end_hour": 7},
+            {"start_hour": -1, "end_hour": 7},
+            {"start_hour": True, "end_hour": 7},
+            {"start_hour": "4", "end_hour": "9"},
+            {"start_hour": 2, "end_hour": None},
+        ],
+    )
+    def test_malformed_overrides_are_ignored(self, raw: Any):
+        assert parse_session_dream_window(raw) is None
+
+    def test_unknown_timezone_falls_back_instead_of_raising(self):
+        with patch("src.dreamer.dream_scheduler.settings.DREAM.WINDOW_TIMEZONE", "UTC"):
+            window = parse_session_dream_window(
+                {"start_hour": 4, "end_hour": 9, "timezone": "Mars/Olympus"}
+            )
+        assert window is not None
+        assert window.timezone == "UTC"
+
+    def test_global_window_can_be_absent(self):
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+                None,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR",
+                None,
+            ),
+        ):
+            assert global_dream_window() is None
+
+    def test_effective_window_prefers_the_session(self):
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+                2,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR", 7
+            ),
+            patch("src.dreamer.dream_scheduler.settings.DREAM.WINDOW_TIMEZONE", "UTC"),
+        ):
+            session = effective_dream_window(
+                {"dream_window": {"start_hour": 20, "end_hour": 23}}
+            )
+            assert session is not None and session.source == "session"
+            assert (session.start_hour, session.end_hour) == (20, 23)
+
+            fallback = effective_dream_window({})
+            assert fallback is not None and fallback.source == "global"
+            assert (fallback.start_hour, fallback.end_hour) == (2, 7)
+
+    @pytest.mark.asyncio
+    async def test_schedule_dream_clamps_into_the_given_window(
+        self, dream_scheduler: DreamScheduler
+    ):
+        """The per-session window must actually move the wake time, not just be parsed."""
+        workspace_name = "test_workspace"
+        work_unit_key = construct_work_unit_key(
+            workspace_name,
+            {
+                "task_type": "dream",
+                "observer": "alice",
+                "observed": "alice",
+                "dream_type": "omni",
+            },
+        )
+        # 2026-09-12 18:00 UTC = 2026-09-13 03:00 +09 in Tokyo: outside 20:00–23:00,
+        # so the dream is deferred to 2026-09-13 20:00 +09 = 11:00 UTC, 17 hours later.
+        fake_now = datetime(2026, 9, 12, 18, 0, tzinfo=UTC)
+        window = DreamWindow(
+            start_hour=20, end_hour=23, timezone="Asia/Tokyo", source="session"
+        )
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.WINDOW_JITTER_MINUTES", 0
+            ),
+            patch("src.dreamer.dream_scheduler.datetime") as mock_datetime,
+            patch.object(
+                dream_scheduler, "_delayed_dream", new_callable=AsyncMock
+            ) as mock_delayed,
+        ):
+            mock_datetime.now.return_value = fake_now
+            await dream_scheduler.schedule_dream(
+                work_unit_key,
+                workspace_name,
+                delay_minutes=60,
+                dream_type=DreamType.OMNI,
+                observer="alice",
+                observed="alice",
+                window=window,
+            )
+
+        assert mock_delayed.call_args.args[2] == pytest.approx(17 * 60, abs=1)
+
+
+class TestResolveDreamWindow:
+    """`resolve_dream_window` reads the window from the collection's newest session.
+
+    A collection is keyed by `(observer, observed)` and spans sessions, so "the window"
+    has to be anchored to a place somehow. Using the newest explicit observation's
+    session is the same heuristic `execute_dream` uses to decide which session a dream
+    belongs to — if the two disagreed, one group's off-peak hours would silently govern
+    another group's dream.
+    """
+
+    async def _seed(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        *,
+        metadata: dict[str, Any],
+    ) -> models.Collection:
+        workspace, peer = sample_data
+        session = models.Session(
+            name="night_shift", workspace_name=workspace.name, h_metadata=metadata
+        )
+        db_session.add(session)
+        collection = models.Collection(
+            observer=peer.name,
+            observed=peer.name,
+            workspace_name=workspace.name,
+            internal_metadata={},
+        )
+        db_session.add(collection)
+        await db_session.flush()
+        db_session.add(
+            models.Document(
+                content="a fact",
+                level="explicit",
+                workspace_name=workspace.name,
+                observer=peer.name,
+                observed=peer.name,
+                session_name=session.name,
+                created_at=datetime(2026, 9, 1, tzinfo=UTC),
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(collection)
+        return collection
+
+    @pytest.mark.asyncio
+    async def test_uses_the_session_override(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        collection = await self._seed(
+            db_session,
+            sample_data,
+            metadata={"dream_window": {"start_hour": 20, "end_hour": 23}},
+        )
+        window = await resolve_dream_window(db_session, collection)
+        assert window is not None
+        assert window.source == "session"
+        assert (window.start_hour, window.end_hour) == (20, 23)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_global_window(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        collection = await self._seed(db_session, sample_data, metadata={})
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+                2,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR", 7
+            ),
+        ):
+            window = await resolve_dream_window(db_session, collection)
+        assert window is not None and window.source == "global"
+
+    @pytest.mark.asyncio
+    async def test_collection_without_documents_has_no_session(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        workspace, peer = sample_data
+        collection = models.Collection(
+            observer=peer.name,
+            observed=peer.name,
+            workspace_name=workspace.name,
+            internal_metadata={},
+        )
+        db_session.add(collection)
+        await db_session.commit()
+        await db_session.refresh(collection)
+
+        # No global window configured, and nothing to scope an override to → there is
+        # genuinely no window. (The developer's .env does configure one, so pin it off.)
+        with (
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_START_HOUR",
+                None,
+            ),
+            patch(
+                "src.dreamer.dream_scheduler.settings.DREAM.ALLOWED_WINDOW_END_HOUR",
+                None,
+            ),
+        ):
+            assert await resolve_dream_window(db_session, collection) is None
+
+    @pytest.mark.asyncio
+    async def test_latest_session_wins(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        collection = await self._seed(
+            db_session,
+            sample_data,
+            metadata={"dream_window": {"start_hour": 20, "end_hour": 23}},
+        )
+        workspace, peer = sample_data
+        db_session.add(
+            models.Session(
+                name="day_shift",
+                workspace_name=workspace.name,
+                h_metadata={"dream_window": {"start_hour": 1, "end_hour": 4}},
+            )
+        )
+        await db_session.flush()
+        db_session.add(
+            models.Document(
+                content="a newer fact",
+                level="explicit",
+                workspace_name=workspace.name,
+                observer=peer.name,
+                observed=peer.name,
+                session_name="day_shift",
+                created_at=datetime(2026, 9, 20, tzinfo=UTC),
+            )
+        )
+        await db_session.commit()
+
+        window = await resolve_dream_window(db_session, collection)
+        assert window is not None
+        assert (window.start_hour, window.end_hour) == (1, 4)
 
 
 class TestWindowJitter:

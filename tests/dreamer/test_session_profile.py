@@ -129,6 +129,46 @@ async def _add_observations(
     await db_session.commit()
 
 
+async def _add_display_names(
+    db_session: AsyncSession,
+    session: models.Session,
+    names: dict[str, str],
+) -> None:
+    """Give members a group card, creating their membership row if it is missing.
+
+    Tests are the only place that may create membership rows directly — the production
+    writer is deliberately update-only (see `crud.record_session_display_names`).
+    """
+    for peer_name in names:
+        existing = (
+            await db_session.execute(
+                select(models.SessionPeer).where(
+                    models.SessionPeer.workspace_name == session.workspace_name,
+                    models.SessionPeer.session_name == session.name,
+                    models.SessionPeer.peer_name == peer_name,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db_session.add(
+                models.SessionPeer(
+                    workspace_name=session.workspace_name,
+                    session_name=session.name,
+                    peer_name=peer_name,
+                    configuration={},
+                    internal_metadata={},
+                )
+            )
+    await db_session.flush()
+    await crud.record_session_display_names(
+        db_session,
+        session.workspace_name,
+        session_name=session.name,
+        names=names,
+        seen_at="2026-10-10T00:00:00Z",
+    )
+
+
 class TestSessionStats:
     async def test_three_tiers_and_lurkers(
         self, db_session: AsyncSession, seeded_session: models.Session
@@ -183,6 +223,245 @@ class TestSessionStats:
             db_session, "no_such_workspace", session_name="nope"
         )
         assert stats is None
+
+
+class TestRosterFacts:
+    """`title` / `role` can only come from the platform's member list (§28.2).
+
+    Honcho cannot call `get_group_member_list`, so these arrive with the client's roster
+    and live in `Session.metadata` alongside `member_count`. What matters here is that
+    they reach the *prompt* attached to a **name** — a roster of bare ids is something a
+    description cannot quote, which is why the enriched form exists.
+    """
+
+    async def test_owner_roles_and_titles_reach_the_block(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        seeded_session.h_metadata = {
+            "group_name": "武汉纺织大学宿舍群",
+            "member_count": 10,
+            "admins": ["user_admin", "user_regular"],
+            "owner": "user_admin",
+            "member_roles": {"user_admin": "owner", "user_regular": "admin"},
+            "member_titles": {"user_regular": "守舍人"},
+            "roster_synced_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+        await db_session.commit()
+        await _add_display_names(
+            db_session,
+            seeded_session,
+            {"user_admin": "老王", "user_regular": "小白"},
+        )
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.owner == "user_admin"
+        assert [s.peer_name for s in stats.admin_details] == [
+            "user_admin",
+            "user_regular",
+        ]
+        assert [s.role for s in stats.admin_details] == ["owner", "admin"]
+
+        block = crud.stats_block(stats)
+        assert "老王(admin)（owner）" in block
+        assert "小白(regular)·守舍人" in block
+
+    async def test_title_falls_back_to_the_observed_fact(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        """A roster is optional; a `title` recorded on the membership row still counts."""
+        row = (
+            await db_session.execute(
+                select(models.SessionPeer).where(
+                    models.SessionPeer.workspace_name == seeded_session.workspace_name,
+                    models.SessionPeer.session_name == seeded_session.name,
+                    models.SessionPeer.peer_name == "user_regular",
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = models.SessionPeer(
+                workspace_name=seeded_session.workspace_name,
+                session_name=seeded_session.name,
+                peer_name="user_regular",
+                configuration={},
+                internal_metadata={},
+            )
+            db_session.add(row)
+        row.internal_metadata = {"display_name": "小白", "title": "守舍人"}
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.top_speakers[0].title == "守舍人"
+        assert "·守舍人" in crud.stats_block(stats)
+
+    async def test_malformed_roster_maps_are_ignored(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        seeded_session.h_metadata = {
+            "member_count": 10,
+            "owner": 12345,
+            "member_roles": ["not", "a", "map"],
+            "member_titles": {"user_regular": 42, "user_occ1": "  "},
+        }
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.owner is None
+        assert all(s.role is None for s in stats.top_speakers)
+        assert all(s.title is None for s in stats.top_speakers)
+
+
+class TestDuplicateDisplayNames:
+    """A name is not an identity (§28.5).
+
+    Two members can both be called 「摸鱼」. The label carries the stable id precisely so
+    this is recoverable — but only if the reader is *told* that the id is load bearing.
+    """
+
+    async def test_two_members_sharing_a_card_are_flagged(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await _add_display_names(
+            db_session,
+            seeded_session,
+            {
+                "user_regular": "摸鱼",
+                "user_occ1": "摸鱼",
+                "user_occ2": "阿黄",
+            },
+        )
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.duplicate_display_names == ["摸鱼"]
+
+        block = crud.stats_block(stats)
+        assert "「摸鱼」" in block
+        assert "提到时必须带上括号里的 id" in block
+
+    async def test_unique_cards_produce_no_warning(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await _add_display_names(
+            db_session,
+            seeded_session,
+            {"user_regular": "小白", "user_occ1": "阿黄"},
+        )
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.duplicate_display_names == []
+        assert "相同的群名片" not in crud.stats_block(stats)
+
+
+class TestRosterStaleness:
+    """A roster is a snapshot, not a fact (§28.3).
+
+    `lurker_count` is `member_count − speaker_count`, so an outdated roster silently
+    turns a lower bound into a number the description will assert. Age is therefore part
+    of the payload, and "unknown" is a third state — not a synonym for "fresh".
+    """
+
+    async def test_fresh_roster_is_reported_as_fresh(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        synced = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=3)
+        seeded_session.h_metadata = {
+            "member_count": 10,
+            "roster_synced_at": synced.isoformat(),
+        }
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.roster_stale is False
+        assert stats.roster_age_seconds is not None
+        assert 2 * 3600 < stats.roster_age_seconds < 4 * 3600
+        block = crud.stats_block(stats)
+        assert "名册同步于 3 小时前" in block
+        assert "⚠️" not in block
+
+    async def test_stale_roster_is_marked_as_a_reference_only(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        synced = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=9)
+        seeded_session.h_metadata = {
+            "member_count": 10,
+            "roster_synced_at": synced.isoformat(),
+        }
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.roster_stale is True
+        block = crud.stats_block(stats)
+        assert "⚠️ 名册同步于 9 天前" in block
+        assert "不要当成现状" in block
+
+    async def test_missing_sync_time_is_unknown_not_fresh(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        seeded_session.h_metadata = {"member_count": 10}
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.roster_age_seconds is None
+        assert stats.roster_stale is None
+        assert "名册同步时间：未知" in crud.stats_block(stats)
+
+    async def test_unparseable_sync_time_is_unknown_not_zero(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        seeded_session.h_metadata = {
+            "member_count": 10,
+            "roster_synced_at": "昨天下午",
+        }
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.roster_synced_at is None
+        assert stats.roster_age_seconds is None
+        assert "名册同步时间：未知" in crud.stats_block(stats)
+
+    async def test_naive_timestamp_is_read_as_utc(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        naive = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        seeded_session.h_metadata = {
+            "member_count": 10,
+            "roster_synced_at": naive.isoformat(),
+        }
+        await db_session.commit()
+
+        stats = await crud.get_session_stats(
+            db_session, seeded_session.workspace_name, session_name=seeded_session.name
+        )
+        assert stats is not None
+        assert stats.roster_age_seconds is not None
+        assert stats.roster_age_seconds < 60
 
 
 class TestSessionProfileStorage:
@@ -430,6 +709,207 @@ class TestRefreshSessionProfile:
 
         assert result is None
         mock_call.assert_not_awaited()
+
+
+class TestFirstBuildSampling:
+    """The first build has no previous version to carry history forward (§28.6).
+
+    A 42k-message group under a 400-observation guard, sampled from the newest window
+    only, yields a "place description" covering roughly the last two days. So the first
+    build samples the **whole history evenly** instead; from the second build on, the
+    newest window plus the previous version is the better trade.
+    """
+
+    async def _seed_history(
+        self, db_session: AsyncSession, session: models.Session, count: int
+    ) -> None:
+        await _add_observations(
+            db_session,
+            session.workspace_name,
+            session.name,
+            [f"observation-{i:03d}" for i in range(count)],
+        )
+
+    async def test_first_build_reaches_back_to_the_oldest_observation(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await self._seed_history(db_session, seeded_session, 40)
+
+        with (
+            patch(
+                "src.dreamer.session_profile.settings.SESSION_PROFILE.MAX_INPUT_OBSERVATIONS",
+                5,
+            ),
+            patch(
+                "src.dreamer.session_profile.honcho_llm_call",
+                new=AsyncMock(return_value=_llm_response()),
+            ) as mock_call,
+        ):
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        # Both ends of the history are in the sample...
+        assert "observation-000" in prompt
+        assert "observation-039" in prompt
+        # ...and it is not just the newest window (which would be 035..039).
+        assert "observation-035" not in prompt
+
+    async def test_first_build_tells_the_model_it_is_a_sample(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await self._seed_history(db_session, seeded_session, 40)
+
+        with (
+            patch(
+                "src.dreamer.session_profile.settings.SESSION_PROFILE.MAX_INPUT_OBSERVATIONS",
+                5,
+            ),
+            patch(
+                "src.dreamer.session_profile.honcho_llm_call",
+                new=AsyncMock(return_value=_llm_response()),
+            ) as mock_call,
+        ):
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        # Sampled material was still not the whole history, so the caveat stands.
+        assert profile.truncated is True
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        assert "整段历史等距抽样" in prompt
+        # It must also say what *not* to conclude from a sample.
+        assert "把某一条观察当成" in prompt
+        # And it must not claim completeness — that is the failure mode being fixed.
+        assert "这次给你的是**全量**原料" not in prompt
+
+    async def test_second_build_uses_the_newest_window_and_carries_forward(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await self._seed_history(db_session, seeded_session, 40)
+        await crud.set_session_profile(
+            db_session,
+            seeded_session.workspace_name,
+            schemas.SessionProfile(text="## 旧\n- 最早的事", oldest="2025-01-01"),
+            session_name=seeded_session.name,
+        )
+
+        with (
+            patch(
+                "src.dreamer.session_profile.settings.SESSION_PROFILE.MAX_INPUT_OBSERVATIONS",
+                5,
+            ),
+            patch(
+                "src.dreamer.session_profile.honcho_llm_call",
+                new=AsyncMock(return_value=_llm_response()),
+            ) as mock_call,
+        ):
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        # Now recency density is worth more than span: the newest observations are in,
+        # the oldest are not, and the older material survives through the profile.
+        assert "observation-039" in prompt
+        assert "observation-000" not in prompt
+        assert "<previous_profile>" in prompt
+        assert "最早的事" in prompt
+        assert "整段历史等距抽样" not in prompt
+        assert profile.oldest == "2025-01-01"
+
+    async def test_small_history_is_not_called_a_sample(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        """Below the guard the material *is* the whole history; saying otherwise would
+        make the model hedge about coverage it actually has."""
+        await self._seed_history(db_session, seeded_session, 3)
+
+        with patch(
+            "src.dreamer.session_profile.honcho_llm_call",
+            new=AsyncMock(return_value=_llm_response()),
+        ) as mock_call:
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        assert profile.truncated is False
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        assert "全量" in prompt
+        assert "整段历史等距抽样" not in prompt
+
+    async def test_sampling_never_exceeds_the_guard(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        await self._seed_history(db_session, seeded_session, 60)
+
+        with (
+            patch(
+                "src.dreamer.session_profile.settings.SESSION_PROFILE.MAX_INPUT_OBSERVATIONS",
+                7,
+            ),
+            patch(
+                "src.dreamer.session_profile.honcho_llm_call",
+                new=AsyncMock(return_value=_llm_response()),
+            ) as mock_call,
+        ):
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        assert profile.observation_count == 7
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        assert 'count="7"' in prompt
+        assert prompt.count("observation-0") == 7
+
+    async def test_sampling_dedupes_across_observers(
+        self, db_session: AsyncSession, seeded_session: models.Session
+    ):
+        """Every observer's collection holds a copy, so a sample must not spend half its
+        budget on duplicates."""
+        for observer, observed in (
+            ("user_regular", "user_regular"),
+            ("foxbot", "user_regular"),
+        ):
+            await _add_observations(
+                db_session,
+                seeded_session.workspace_name,
+                seeded_session.name,
+                [f"only-{i}" for i in range(10)],
+                observer=observer,
+                observed=observed,
+            )
+
+        with (
+            patch(
+                "src.dreamer.session_profile.settings.SESSION_PROFILE.MAX_INPUT_OBSERVATIONS",
+                4,
+            ),
+            patch(
+                "src.dreamer.session_profile.honcho_llm_call",
+                new=AsyncMock(return_value=_llm_response()),
+            ) as mock_call,
+        ):
+            profile = await refresh_session_profile_if_needed(
+                seeded_session.workspace_name, seeded_session.name, 200
+            )
+
+        assert profile is not None
+        assert mock_call.await_args is not None
+        prompt = mock_call.await_args.kwargs["prompt"]
+        assert prompt.count("only-0") == 1
+        assert profile.observation_count == 4
 
 
 class TestSessionProfilePrompt:

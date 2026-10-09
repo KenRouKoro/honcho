@@ -25,7 +25,7 @@ from datetime import datetime
 from inspect import cleandoc as c
 
 from nanoid import generate as generate_nanoid
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
@@ -73,6 +73,7 @@ def session_profile_prompt(
     max_tokens: int,
     today: str,
     previous_profile_text: str | None = None,
+    sampled: bool = False,
 ) -> str:
     """构造场地描述的压缩提示词。
 
@@ -83,6 +84,8 @@ def session_profile_prompt(
         max_tokens: 正文输出上限
         today: 当前日期（ISO date）。观察只有日期，没有"现在"就判不了时效
         previous_profile_text: 仅在原料被截断时提供
+        sampled: 原料是**整段历史的等距抽样**（首次压缩）。与"最近一段"的语义差别
+            很大：抽样里两个相邻的观察可能隔了几个月，不能拿它推断"最近怎样"
     """
     if previous_profile_text:
         carry_section = c("""
@@ -95,6 +98,14 @@ def session_profile_prompt(
         {previous_profile}
         </previous_profile>
         """).format(previous_profile=previous_profile_text)
+    elif sampled:
+        carry_section = c("""
+        **注意原料是"抽样"，不是"最近一段"，也不是全量。** 这个场地存在很久、观察太多，
+        所以我们把**整段历史等距抽样**给你：相邻两条可能相隔几个月。请据此写一份
+        **跨时间也成立**的描述（这是什么地方、长期氛围与规矩、反复出现的话题），
+        **不要**把某一条观察当成"现状"，也不要写只在某几天成立的东西。
+        这是第一版，没有旧版本可参考，请从零写。
+        """)
     else:
         carry_section = "这次给你的是**全量**原料，请从零重写整份描述，不要保留任何你记忆里的旧版本。"
 
@@ -117,11 +128,16 @@ def session_profile_prompt(
     4. **成员构成一节必须逐字引用 <session_stats> 的数字**，不要自己数、不要自己估。
        特别地：**纯潜水的人不会出现在下面的观察里**——如果统计给了潜水人数，
        就照写；如果统计说名册未知，就写"人数不明"，**不要假装群里只有出现过的人**。
+       统计里标了「名册同步于 ……」的，按它的新鲜度说话：标了 ⚠️ 过时的，
+       要写成"据较早的名册"而不是现状。
     5. 用「今天」判断时效。已经过去的临时事件（某次活动、某场考试）不要写成现状。
     6. **每条观察都要有归宿。** 哪一节都不太契合但长期有价值的，写进最接近的一节，
        不要因为"分节不合适"就把内容丢掉。
-    7. 用**观察本身的语言**输出（观察是中文就写中文）。
-    8. 输出就是描述正文本身——不要前言、不要解释、不要元评论、不要复述这些要求。
+    7. **同名不等于同人，改名不等于换人。** 标注「曾用名：X」的人，较早的观察里
+       可能就用 X 称呼他，那是同一个人；而统计里若提示"不止一个人用相同的群名片"，
+       那几个**是不同的人**，不要合并成一个。
+    8. 用**观察本身的语言**输出（观察是中文就写中文）。
+    9. 输出就是描述正文本身——不要前言、不要解释、不要元评论、不要复述这些要求。
 
     固定分节（按此顺序，节标题原样使用）：
 
@@ -161,6 +177,8 @@ async def _fetch_session_observations(
     workspace_name: str,
     session_name: str,
     limit: int,
+    *,
+    stratified: bool = False,
 ) -> list[tuple[str, datetime]]:
     """取该 session 的 explicit 观察（时间正序）。
 
@@ -169,7 +187,15 @@ async def _fetch_session_observations(
     这样无论这个 session 有哪些 collection 都能拿到一份干净的原料。
 
     多取 ``limit`` 条是为了给去重留余量（重复率最高约 2×）。
+
+    ``stratified``（§28.6）：**第一次**压缩时没有上一版可续，如果仍然只取最近一段，
+    一个有 4 万条消息的群会得到一份只覆盖最近两天的"场地描述"。所以首次改为
+    **按整段历史等距抽样**——均匀覆盖，样本量不变。第二次起回到"最近窗口 + 续压上一版"，
+    因为那时近期密度才是更该保住的东西。
     """
+    if stratified:
+        return await _fetch_stratified(db, workspace_name, session_name, limit)
+
     stmt = (
         select(models.Document.content, models.Document.created_at)
         .where(
@@ -195,6 +221,79 @@ async def _fetch_session_observations(
             break
 
     deduped.reverse()  # 时间正序送进提示词
+    return deduped
+
+
+async def _fetch_stratified(
+    db: AsyncSession,
+    workspace_name: str,
+    session_name: str,
+    limit: int,
+) -> list[tuple[str, datetime]]:
+    """等距抽样：整段历史里均匀取约 ``limit`` 条。
+
+    用窗口函数在 SQL 里算 ``row_number`` 与总数，只把抽中的行取回来——**不把整个
+    历史拉进内存**。抽样按物理行做（含跨 observer 的重复），再把重复留给后面的按内容
+    去重，所以 stride 按 ``limit * 2`` 算，与上面的余量一致。
+
+    ``rn = 1``（最早）与 ``rn = total``（最新）都会被选中，所以描述同时有最老的锚点和
+    最新的锚点；中间是均匀的。
+    """
+    want = max(1, limit * 2)
+    numbered = (
+        select(
+            models.Document.content.label("content"),
+            models.Document.created_at.label("created_at"),
+            func.row_number()
+            .over(order_by=(models.Document.created_at, models.Document.id))
+            .label("rn"),
+            func.count().over().label("total"),
+        )
+        .where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.session_name == session_name,
+            models.Document.level == "explicit",
+            models.Document.deleted_at.is_(None),
+        )
+        .subquery()
+    )
+    # `floor` is load-bearing, not decoration: SQLAlchemy renders `/` on an integer
+    # expression as `CAST(x AS NUMERIC)` to keep *true* division, so `total / want` is
+    # 4.28 rather than 4. A fractional stride makes `% stride == 0` match almost
+    # nothing, which silently collapses the sample to just the two pinned endpoints —
+    # observed directly, and exactly the kind of bug that looks like "it works".
+    stride = func.greatest(1, func.floor(numbered.c.total / want))
+    stmt = (
+        select(numbered.c.content, numbered.c.created_at)
+        .where(
+            (numbered.c.total <= want)
+            # `rn = total` is pinned so the **newest** explicit observation is always in
+            # the sample. A pure stride would drop it whenever `total - 1` is not a
+            # multiple of the stride, and with it any anchor for "how things are now".
+            | (numbered.c.rn == numbered.c.total)
+            | (((numbered.c.rn - 1) % stride) == 0)
+        )
+        .order_by(numbered.c.created_at, numbered.c.rn)
+    )
+    rows = (await db.execute(stmt)).all()
+
+    seen: set[str] = set()
+    deduped: list[tuple[str, datetime]] = []
+    for content, created_at in rows:
+        key = content.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((content, created_at))
+
+    # 去重后可能仍多于 limit（重复率低于 2× 时）——再等距降采样一次，
+    # 保住"均匀覆盖"，而不是砍掉后半段。两端都显式保留。
+    if len(deduped) > limit:
+        total = len(deduped)
+        if limit == 1:
+            deduped = [deduped[total // 2]]
+        else:
+            deduped = [deduped[(i * (total - 1)) // (limit - 1)] for i in range(limit)]
     return deduped
 
 
@@ -237,8 +336,20 @@ async def refresh_session_profile_if_needed(
 
     # 第一个 DB 窗口：只读。取完原料就关掉——外部调用期间绝不持有会话。
     async with tracked_db("session_profile.fetch") as db:
+        # 先看有没有上一版：它决定了原料该**怎么**取（§28.6）。
+        try:
+            previous = await crud.get_session_profile(
+                db, workspace_name, session_name=session_name
+            )
+        except ResourceNotFoundException:
+            previous = None
+
         observations = await _fetch_session_observations(
-            db, workspace_name, session_name, cfg.MAX_INPUT_OBSERVATIONS
+            db,
+            workspace_name,
+            session_name,
+            cfg.MAX_INPUT_OBSERVATIONS,
+            stratified=previous is None,
         )
         stats = await crud.get_session_stats(
             db, workspace_name, session_name=session_name
@@ -251,14 +362,6 @@ async def refresh_session_profile_if_needed(
             )
             return None
         truncated = len(observations) >= cfg.MAX_INPUT_OBSERVATIONS
-        if truncated:
-            # 整体替换语义 + 截断 = 更早的原料会永久消失，所以带上上一版一起压。
-            try:
-                previous = await crud.get_session_profile(
-                    db, workspace_name, session_name=session_name
-                )
-            except ResourceNotFoundException:
-                previous = None
 
     if not observations:
         logger.debug(
@@ -268,6 +371,10 @@ async def refresh_session_profile_if_needed(
         )
         return None
 
+    # 首次 + 抽样命中上限 = 原料是**历史等距抽样**，不是"最近一段"。
+    # 提示词必须说清是哪一种，否则模型会把抽样样本当成完整历史来下结论。
+    sampled = previous is None and truncated
+
     prompt = session_profile_prompt(
         observations_text=_format_observations(observations),
         observation_count=len(observations),
@@ -275,6 +382,7 @@ async def refresh_session_profile_if_needed(
         max_tokens=cfg.MAX_TOKENS,
         today=utc_now_iso()[:10],
         previous_profile_text=previous.text if previous else None,
+        sampled=sampled,
     )
 
     trace_id = generate_nanoid()

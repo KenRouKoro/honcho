@@ -25,6 +25,7 @@ why the client deliberately only ever writes the *global* nickname there.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from sqlalchemy import select, update
@@ -32,6 +33,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,130 @@ NICKNAME_KEY = "nickname"  # QQ 昵称：全局名，作为名片的快照留底
 TITLE_KEY = "title"  # 专属头衔（平台 MemberInfo.title）
 ROLE_KEY = "role"  # owner / admin / member
 SEEN_AT_KEY = "display_name_seen_at"  # 最近一次观察到该名片的时刻（ISO 8601）
+# 有界的曾用名列表，最近的在前：`[{"name": "老白", "last_seen": "...Z"}, …]`
+# 观察是**按当时的名字**写的，所以旧名字仍然活在较早的观察里；不记历史，
+# 模型就没有任何线索把"老白"和"小白"认成同一个人（§28.1）。
+DISPLAY_NAME_HISTORY_KEY = "display_name_history"
+
+
+@dataclass
+class SessionMemberFacts:
+    """Everything known about a member **in one session**.
+
+    ``display_name`` / ``previous_names`` are observed (Honcho writes them from the
+    group card that rides along with every message); ``title`` / ``role`` can only be
+    *declared* by the client's roster and are surfaced for the caller's benefit — they
+    are not invented here.
+    """
+
+    peer_name: str
+    display_name: str | None = None
+    previous_names: list[str] = field(default_factory=list)
+    title: str | None = None
+    role: str | None = None
+    seen_at: str | None = None
+
+
+def _clean_history(value: Any) -> list[dict[str, str]]:
+    """Validate a stored history list, dropping anything malformed.
+
+    Defensive on purpose: this value is JSONB written by older/other code paths, and a
+    corrupt entry must degrade to "no history" rather than crash a prompt build.
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in cast(list[Any], value):
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, Any], item)
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        last_seen = entry.get("last_seen")
+        out.append(
+            {
+                "name": name.strip(),
+                "last_seen": last_seen if isinstance(last_seen, str) else "",
+            }
+        )
+    return out
+
+
+def _text(meta: dict[str, Any], key: str) -> str | None:
+    value = meta.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+async def get_session_member_facts(
+    db: AsyncSession,
+    workspace_name: str,
+    *,
+    session_name: str,
+    peers: list[str] | None = None,
+) -> dict[str, SessionMemberFacts]:
+    """Return ``{peer_name: SessionMemberFacts}`` for a session.
+
+    Args:
+        db: database session
+        workspace_name: workspace
+        session_name: session
+        peers: restrict to these peers (``None`` = every member row with a card)
+
+    Returns:
+        Only peers with at least one known fact; absent peers are missing, never blank.
+    """
+    stmt = select(
+        models.SessionPeer.peer_name, models.SessionPeer.internal_metadata
+    ).where(
+        models.SessionPeer.workspace_name == workspace_name,
+        models.SessionPeer.session_name == session_name,
+    )
+    if peers is not None:
+        if not peers:
+            return {}
+        stmt = stmt.where(models.SessionPeer.peer_name.in_(peers))
+
+    rows = (await db.execute(stmt)).all()
+    out: dict[str, SessionMemberFacts] = {}
+    for peer_name, metadata in rows:
+        meta = cast(dict[str, Any], metadata or {})
+
+        raw_name = meta.get(DISPLAY_NAME_KEY)
+        display_name = raw_name.strip() if isinstance(raw_name, str) else None
+        if display_name == "":
+            display_name = None
+
+        history = _clean_history(meta.get(DISPLAY_NAME_HISTORY_KEY))
+        previous_names: list[str] = []
+        for entry in history:
+            name = entry["name"]
+            if name == display_name or name in previous_names:
+                continue
+            previous_names.append(name)
+
+        title = _text(meta, TITLE_KEY)
+        role = _text(meta, ROLE_KEY)
+        seen_at = _text(meta, SEEN_AT_KEY)
+
+        if (
+            display_name is None
+            and not previous_names
+            and title is None
+            and role is None
+        ):
+            continue
+        out[peer_name] = SessionMemberFacts(
+            peer_name=peer_name,
+            display_name=display_name,
+            previous_names=previous_names,
+            title=title,
+            role=role,
+            seen_at=seen_at,
+        )
+    return out
 
 
 async def get_session_display_names(
@@ -61,25 +187,34 @@ async def get_session_display_names(
     Returns:
         Only peers whose card is known; absent peers are simply missing, never blank.
     """
-    stmt = select(
-        models.SessionPeer.peer_name, models.SessionPeer.internal_metadata
-    ).where(
-        models.SessionPeer.workspace_name == workspace_name,
-        models.SessionPeer.session_name == session_name,
+    facts = await get_session_member_facts(
+        db, workspace_name, session_name=session_name, peers=peers
     )
-    if peers is not None:
-        if not peers:
-            return {}
-        stmt = stmt.where(models.SessionPeer.peer_name.in_(peers))
+    return {
+        peer: fact.display_name
+        for peer, fact in facts.items()
+        if fact.display_name is not None
+    }
 
-    rows = (await db.execute(stmt)).all()
-    out: dict[str, str] = {}
-    for peer_name, metadata in rows:
-        meta = cast(dict[str, Any], metadata or {})
-        value = meta.get(DISPLAY_NAME_KEY)
-        if isinstance(value, str) and value.strip():
-            out[peer_name] = value.strip()
-    return out
+
+def _next_history(
+    *, current_name: str | None, current_seen_at: str | None, stored: Any, seen_at: str
+) -> list[dict[str, str]]:
+    """Bounded, most-recent-first list of names this member used before ``seen_at``."""
+    limit = settings.SESSION_PROFILE.DISPLAY_NAME_HISTORY_LIMIT
+    if limit <= 0:
+        return []
+    history = _clean_history(stored)
+    if current_name:
+        # The name we are about to replace starts its life as a *previous* name. Its
+        # `last_seen` is when we last observed it, which is exactly what tells the model
+        # which observations were written under it.
+        history = [entry for entry in history if entry["name"] != current_name]
+        history.insert(
+            0,
+            {"name": current_name, "last_seen": current_seen_at or seen_at},
+        )
+    return history[:limit]
 
 
 async def record_session_display_names(
@@ -127,6 +262,23 @@ async def record_session_display_names(
         for key, value in (extra or {}).get(peer, {}).items():
             if value:
                 patch[key] = value
+
+        # §28.1: a rename must not erase the name the earlier observations were written
+        # under. Keep a bounded, most-recent-first history so "老白" and "小白" can still
+        # be recognised as one person. Only pay for it when the name actually changed.
+        if current is not None:
+            previous_name = current.get(DISPLAY_NAME_KEY)
+            if isinstance(previous_name, str) and previous_name.strip() != name:
+                patch[DISPLAY_NAME_HISTORY_KEY] = _next_history(
+                    current_name=previous_name.strip(),
+                    current_seen_at=(
+                        current.get(SEEN_AT_KEY)
+                        if isinstance(current.get(SEEN_AT_KEY), str)
+                        else None
+                    ),
+                    stored=current.get(DISPLAY_NAME_HISTORY_KEY),
+                    seen_at=seen_at,
+                )
 
         # Update-only: membership rows are created by the session/message paths, and a
         # membership row that exists but carries a name we already have is a no-op.

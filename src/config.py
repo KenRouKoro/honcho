@@ -1323,11 +1323,30 @@ class SessionProfileSettings(HonchoSettings):
     TOP_SPEAKERS: Annotated[int, Field(default=10, ge=0, le=100)] = 10
 
     # 名册总数、群名等由客户端写进 `Session.metadata`；这里声明键名，
-    # 免得 Honcho 侧硬编码字符串（契约见 doc/memory_layer_decision.md §23.6）。
+    # 免得 Honcho 侧硬编码字符串（契约见 doc/memory_layer_decision.md §23.6、§28）。
     MEMBER_COUNT_METADATA_KEY: str = "member_count"
     MAX_MEMBER_COUNT_METADATA_KEY: str = "max_member_count"
     GROUP_NAME_METADATA_KEY: str = "group_name"
     ADMINS_METADATA_KEY: str = "admins"
+
+    # §28.2：`title` / `role` 只有平台 API 知道（OneBot `get_group_member_list`），
+    # Honcho 拿不到，只能由客户端随名册一起推。所以它们与本节的其余名册字段同源，
+    # 都住在 `Session.metadata` 里，而不是 `session_peers.internal_metadata`——
+    # 后者是 Honcho 自己观察出来的（群名片），前者是客户端"声明"的平台事实。
+    OWNER_METADATA_KEY: str = "owner"
+    MEMBER_ROLES_METADATA_KEY: str = "member_roles"
+    MEMBER_TITLES_METADATA_KEY: str = "member_titles"
+
+    # §28.3：名册是**快照**。潜水人数是 `名册人数 − 说过话的人数`，
+    # 名册一旦过时就只是个下界；超过这个年龄就在提示词里明确标注"可能过时"，
+    # 而不是把一个陈旧数字当成现状。
+    ROSTER_SYNCED_AT_METADATA_KEY: str = "roster_synced_at"
+    ROSTER_MAX_AGE_HOURS: Annotated[int, Field(default=48, gt=0, le=24 * 365)] = 48
+
+    # §28.1：一个人在本群改过几次名。观察是**按当时的名字**写的，所以旧名字仍然
+    # 存在于较早的观察里；留一截有界历史，才能让"老白"和"小白"被认成同一个人。
+    # 0 = 不留历史。
+    DISPLAY_NAME_HISTORY_LIMIT: Annotated[int, Field(default=3, ge=0, le=20)] = 3
 
 
 class RepresentationSettings(HonchoSettings):
@@ -1522,6 +1541,14 @@ class DreamSettings(HonchoSettings):
     # collection's load (measured: 133 of 569 dreams landed in the 02:00 hour —
     # doc/memory_layer_decision.md §24.2). 0 disables the jitter.
     WINDOW_JITTER_MINUTES: Annotated[int, Field(default=180, ge=0, le=1440)] = 180
+
+    # Per-session override of the window above, read from
+    # `Session.metadata[SESSION_WINDOW_METADATA_KEY]` as
+    # `{"start_hour": int, "end_hour": int, "timezone": str}` (every key optional).
+    # The global window is an off-peak assumption about *the deployment's* timezone;
+    # a night-shift or overseas group is quiet at a different hour, so the window has
+    # to be a property of the place, not of the process (§28.4).
+    SESSION_WINDOW_METADATA_KEY: str = "dream_window"
 
     # Agent iteration limit - increased for extended reasoning workflow
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20

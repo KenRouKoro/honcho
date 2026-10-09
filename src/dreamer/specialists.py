@@ -614,13 +614,17 @@ Extract implicit information:
 - "has kids ages 5 and 8" → "is a parent", "has school-age children"
 
 ### Contradictions
-When statements can't both be true (not just updates), flag them:
+When statements can't both be true (not just updates), flag them with
+`create_observations_contradiction`:
 - "I love coffee" vs "I hate coffee" → contradiction observation
+A contradiction needs **at least two** source observations that genuinely conflict.
+If one value simply replaced another over time, that is a **knowledge update**, not a
+contradiction. Do not invent a conflict to fill this section — an empty result is fine.
 {peer_card_section}
 
 ## CREATING OBSERVATIONS
 
-Use `create_observations_deductive`.
+Use `create_observations_deductive` for logical necessities.
 
 ```json
 {{
@@ -628,6 +632,18 @@ Use `create_observations_deductive`.
     "content": "The logical conclusion",
     "source_ids": ["id1", "id2"],
     "premises": ["premise 1 text", "premise 2 text"]
+  }}]
+}}
+```
+
+Use `create_observations_contradiction` for conflicts between known facts.
+
+```json
+{{
+  "observations": [{{
+    "content": "The two conflicting claims stated together",
+    "source_ids": ["id1", "id2"],
+    "sources": ["claim 1 text", "claim 2 text"]
   }}]
 }}
 ```

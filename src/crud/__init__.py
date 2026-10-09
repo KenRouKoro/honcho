@@ -10,7 +10,9 @@ from .deriver import (
 )
 from .display_name import (
     DISPLAY_NAME_KEY,
+    SessionMemberFacts,
     get_session_display_names,
+    get_session_member_facts,
     record_session_display_names,
     short_peer_id,
 )
@@ -209,6 +211,8 @@ __all__ = [
     # 群名片（per-session display name）
     "DISPLAY_NAME_KEY",
     "get_session_display_names",
+    "get_session_member_facts",
+    "SessionMemberFacts",
     "record_session_display_names",
     "short_peer_id",
     "get_session_stats",

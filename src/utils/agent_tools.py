@@ -293,6 +293,47 @@ def _inductive_observation_item_schema() -> dict[str, Any]:
     }
 
 
+def _contradiction_observation_item_schema() -> dict[str, Any]:
+    """Contradictions: two (or more) observations that cannot both be true.
+
+    A separate tool rather than a `level` field on the deductive one, because the two
+    have *different required evidence and different semantics*: a deduction follows
+    from its premises, a contradiction is a conflict between them. Deriving the level
+    from a schema-validated tool name is also what keeps the write path auditable —
+    nothing else in the dreamer can produce this level.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": (
+                    "The contradiction as a self-contained statement, naming both "
+                    "conflicting claims so it makes sense on its own"
+                ),
+            },
+            "source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "description": (
+                    "Required; at least two observation IDs that conflict with each other"
+                ),
+            },
+            "sources": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "description": (
+                    "Required; the human-readable text of those conflicting claims"
+                ),
+            },
+        },
+        "required": ["content", "source_ids", "sources"],
+        "additionalProperties": False,
+    }
+
+
 def _safe_int(value: Any, default: int) -> int:
     """Coerce a tool input value to int, returning default on failure.
 
@@ -510,6 +551,26 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "array",
                     "description": "List of new inductive observations to create",
                     "items": _inductive_observation_item_schema(),
+                },
+            },
+            "required": ["observations"],
+        },
+    },
+    "create_observations_contradiction": {
+        "name": "create_observations_contradiction",
+        "description": (
+            "Create contradiction observations: two or more existing observations that "
+            "cannot both be true. Requires at least two source_ids and their source text. "
+            "Use this for genuine conflicts, NOT for a value that was simply updated — a "
+            "newer value supersedes the old one, it does not contradict it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "description": "List of new contradiction observations to create",
+                    "items": _contradiction_observation_item_schema(),
                 },
             },
             "required": ["observations"],
@@ -934,6 +995,11 @@ DEDUCTION_SPECIALIST_TOOLS: list[dict[str, Any]] = [
     TOOLS["search_messages"],
     # Action tools
     TOOLS["create_observations_deductive"],
+    # §28.7: the prompt has always told this specialist to flag contradictions, but
+    # until now its only write tool hard-coded `level="deductive"` — so the level was
+    # dead (0 rows workspace-wide, no write path). Contradictions are a deduction-phase
+    # judgement (they compare what is already known), hence deduction, not induction.
+    TOOLS["create_observations_contradiction"],
     TOOLS["delete_observations"],
     TOOLS["update_peer_card"],
 ]
@@ -1703,6 +1769,16 @@ async def _handle_create_observations_inductive(
         ctx,
         tool_input,
         forced_level="inductive",
+    )
+
+
+async def _handle_create_observations_contradiction(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
+    return await _handle_create_observations_impl(
+        ctx,
+        tool_input,
+        forced_level="contradiction",
     )
 
 
@@ -2601,6 +2677,7 @@ _TOOL_HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], Any]] = {
     "create_observations": _handle_create_observations,
     "create_observations_deductive": _handle_create_observations_deductive,
     "create_observations_inductive": _handle_create_observations_inductive,
+    "create_observations_contradiction": _handle_create_observations_contradiction,
     "update_peer_card": _handle_update_peer_card,
     "get_recent_history": _handle_get_recent_history,
     "search_memory": _handle_search_memory,

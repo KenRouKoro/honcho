@@ -241,6 +241,186 @@ class TestDisplayNameStorage:
         )
 
 
+class TestRenameHistory:
+    """A rename must not orphan the observations written under the old name (§28.1).
+
+    On the reference deployment the bot itself had five different cards in one group, so
+    renames are not a corner case. Observations are written *with the name of the day*,
+    which means an older observation still says 「老白」 — without a bounded history the
+    reader has no way to know that 老白 and 小白 are the same person.
+    """
+
+    async def test_rename_records_the_old_name(
+        self, db_session: AsyncSession, named_session: models.Session
+    ):
+        workspace_name = named_session.workspace_name
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "老白"},
+            seen_at="2026-01-01T00:00:00Z",
+        )
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "小白"},
+            seen_at="2026-02-01T00:00:00Z",
+        )
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].display_name == "小白"
+        assert facts["user_111"].previous_names == ["老白"]
+        # The old name's last-seen is when we last *saw* it, not when we replaced it —
+        # that is what bounds which observations used it.
+        assert facts["user_111"].seen_at == "2026-02-01T00:00:00Z"
+
+    async def test_renaming_back_does_not_duplicate(
+        self, db_session: AsyncSession, named_session: models.Session
+    ):
+        workspace_name = named_session.workspace_name
+        for name, day in (("A", 1), ("B", 2), ("A", 3)):
+            await crud.record_session_display_names(
+                db_session,
+                workspace_name,
+                session_name=named_session.name,
+                names={"user_111": name},
+                seen_at=f"2026-01-0{day}T00:00:00Z",
+            )
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].display_name == "A"
+        assert facts["user_111"].previous_names == ["B"]
+
+    async def test_history_is_bounded_and_most_recent_first(
+        self, db_session: AsyncSession, named_session: models.Session, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "src.crud.display_name.settings.SESSION_PROFILE.DISPLAY_NAME_HISTORY_LIMIT",
+            2,
+        )
+        workspace_name = named_session.workspace_name
+        for i, name in enumerate(["n0", "n1", "n2", "n3"], start=1):
+            await crud.record_session_display_names(
+                db_session,
+                workspace_name,
+                session_name=named_session.name,
+                names={"user_111": name},
+                seen_at=f"2026-01-0{i}T00:00:00Z",
+            )
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].previous_names == ["n2", "n1"]
+
+    async def test_history_can_be_disabled(
+        self, db_session: AsyncSession, named_session: models.Session, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "src.crud.display_name.settings.SESSION_PROFILE.DISPLAY_NAME_HISTORY_LIMIT",
+            0,
+        )
+        workspace_name = named_session.workspace_name
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "老白"},
+            seen_at="2026-01-01T00:00:00Z",
+        )
+        # Unchanged name, so nothing to record anyway; the point is the *rename* below.
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "小白"},
+            seen_at="2026-02-01T00:00:00Z",
+        )
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].display_name == "小白"
+        assert facts["user_111"].previous_names == []
+
+    async def test_a_corrupt_history_entry_is_ignored(
+        self, db_session: AsyncSession, named_session: models.Session
+    ):
+        """Defensive: this value is JSONB that older or other code paths can write.
+        A malformed entry must degrade to 'no history', never break a prompt build."""
+        workspace_name = named_session.workspace_name
+        row = (
+            await db_session.execute(
+                select(models.SessionPeer).where(
+                    models.SessionPeer.workspace_name == workspace_name,
+                    models.SessionPeer.session_name == named_session.name,
+                    models.SessionPeer.peer_name == "user_111",
+                )
+            )
+        ).scalar_one()
+        row.internal_metadata = {
+            "display_name": "小白",
+            "display_name_history": [
+                "not-a-dict",
+                {"name": ""},
+                {"name": 42},
+                {"name": "老白", "last_seen": "2026-01-01T00:00:00Z"},
+            ],
+        }
+        await db_session.commit()
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].previous_names == ["老白"]
+
+    async def test_current_name_is_never_listed_as_previous(
+        self, db_session: AsyncSession, named_session: models.Session
+    ):
+        workspace_name = named_session.workspace_name
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "A"},
+            seen_at="2026-01-01T00:00:00Z",
+        )
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "B"},
+            seen_at="2026-01-02T00:00:00Z",
+        )
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "A"},
+            seen_at="2026-01-03T00:00:00Z",
+        )
+        await crud.record_session_display_names(
+            db_session,
+            workspace_name,
+            session_name=named_session.name,
+            names={"user_111": "B"},
+            seen_at="2026-01-04T00:00:00Z",
+        )
+
+        facts = await crud.get_session_member_facts(
+            db_session, workspace_name, session_name=named_session.name
+        )
+        assert facts["user_111"].display_name == "B"
+        assert "B" not in facts["user_111"].previous_names
+        assert facts["user_111"].previous_names == ["A"]
+
+
 class TestStatsSurfacesNames:
     async def test_top_speakers_carry_the_group_card(
         self, db_session: AsyncSession, named_session: models.Session
