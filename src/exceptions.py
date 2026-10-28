@@ -134,6 +134,18 @@ class VectorStoreError(HonchoException):
 
 
 @final
+class EmbeddingUnavailableError(HonchoException):
+    """Raised when the embedding provider cannot be reached or fails.
+
+    Distinct from a token-limit violation (which is a 422): there is nothing the
+    caller can fix, so it must surface as 503 rather than a silent empty result.
+    """
+
+    status_code = 503
+    detail = "embedding service unavailable"
+
+
+@final
 class RepresentationSaveError(HonchoException):
     """Raised when every observer's representation save fails in a batch."""
 

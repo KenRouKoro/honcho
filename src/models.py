@@ -1,6 +1,6 @@
 import datetime
 from logging import getLogger
-from typing import Any, final
+from typing import Any, final, override
 
 from dotenv import load_dotenv
 from nanoid import generate as generate_nanoid
@@ -23,7 +23,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, TEXT
 from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, relationship
 from sqlalchemy.sql import func
-from typing_extensions import override
 
 from src.config import settings
 from src.utils.types import DocumentLevel, TaskType, VectorSyncState
@@ -577,3 +576,56 @@ class SessionPeer(Base):
     internal_metadata: Mapped[dict[str, Any]]
     joined_at: Mapped[datetime.datetime]
     left_at: Mapped[datetime.datetime | None]
+
+
+@final
+class KnowledgeEntry(Base):
+    """A standalone, explicitly saved knowledge note.
+
+    Not a ``Document`` and not an observation: it is owned by a workspace only,
+    is never produced by the deriver/dreamer, and never feeds representations,
+    peer cards or recall. ``content_hash`` (sha256 of the normalised content) is
+    unique per workspace, so re-saving the same content is idempotent.
+    """
+
+    __tablename__: str = "knowledge_entries"
+    id: Mapped[str] = mapped_column(TEXT, default=generate_nanoid, primary_key=True)
+    workspace_name: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.name", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(TEXT, nullable=False)
+    content: Mapped[str] = mapped_column(TEXT, nullable=False)
+    source: Mapped[str] = mapped_column(TEXT, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    content_hash: Mapped[str] = mapped_column(TEXT, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(_VECTOR_DIM), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("length(id) = 21", name="id_length"),
+        CheckConstraint("id ~ '^[A-Za-z0-9_-]+$'", name="id_format"),
+        CheckConstraint("length(title) <= 200", name="title_length"),
+        CheckConstraint("length(content) <= 4000", name="content_length"),
+        CheckConstraint("length(source) <= 500", name="source_length"),
+        UniqueConstraint("workspace_name", "content_hash"),
+        Index(
+            "ix_knowledge_entries_workspace_created_at", "workspace_name", "created_at"
+        ),
+        Index(
+            "ix_knowledge_entries_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )

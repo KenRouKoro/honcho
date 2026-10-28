@@ -13,7 +13,7 @@ can be tuned against a budget.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import ClassVar, Literal
 
 from pydantic import Field
@@ -22,7 +22,7 @@ from src.config import ModelTransport
 from src.telemetry.events.base import BaseEvent
 
 
-class CallPurpose(str, Enum):
+class CallPurpose(StrEnum):
     """Closed taxonomy for LLM call purposes.
 
     The schema lint enforces that all `LLMCallCompletedEvent` emissions use a
@@ -154,7 +154,7 @@ class LLMCallCompletedEvent(BaseEvent):
         return f"{run}:{iteration}:{self.attempt}:{self.transport}:{self.model}"
 
 
-class EmbeddingCallPurpose(str, Enum):
+class EmbeddingCallPurpose(StrEnum):
     """Closed taxonomy for embedding call purposes.
 
     Mirrors `CallPurpose` for LLM calls. Adding a new embedding call site
@@ -178,6 +178,8 @@ class EmbeddingCallPurpose(str, Enum):
     SESSION_CONTEXT_SEARCH = "session_context_search"
     PREFERENCE_EXTRACTION = "preference_extraction"
     GENERIC_DOCUMENT_SEARCH = "generic_document_search"
+    # Standalone knowledge entries (save + semantic query) on the API path.
+    KNOWLEDGE = "knowledge"
 
 
 class EmbeddingCallCompletedEvent(BaseEvent):

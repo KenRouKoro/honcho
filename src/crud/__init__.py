@@ -33,6 +33,21 @@ from .document import (
     query_documents_recent,
     query_external_vector_document_ids,
 )
+from .knowledge import (
+    KnowledgePatch,
+    content_hash,
+    create_entry,
+    delete_entry,
+    embed_knowledge_text,
+    embedding_input,
+    ensure_workspace_exists,
+    get_entry,
+    get_entry_by_content_hash,
+    list_entries,
+    normalize_content,
+    query_entries,
+    update_entry,
+)
 from .message import (
     create_messages,
     get_message,
@@ -217,6 +232,20 @@ __all__ = [
     "short_peer_id",
     "get_session_stats",
     "stats_block",
+    # Knowledge
+    "KnowledgePatch",
+    "content_hash",
+    "create_entry",
+    "delete_entry",
+    "embed_knowledge_text",
+    "embedding_input",
+    "ensure_workspace_exists",
+    "get_entry",
+    "get_entry_by_content_hash",
+    "list_entries",
+    "normalize_content",
+    "query_entries",
+    "update_entry",
     # Webhook
     "get_or_create_webhook_endpoint",
     "delete_webhook_endpoint",

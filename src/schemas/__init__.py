@@ -94,6 +94,18 @@ from src.schemas.internal import (
     SessionCounts,
     SessionPeerData,
 )
+from src.schemas.knowledge import (
+    KnowledgeCreateResult,
+    KnowledgeEntry,
+    KnowledgeEntryCreate,
+    KnowledgeEntryResult,
+    KnowledgeEntryUpdate,
+    KnowledgeHit,
+    KnowledgePage,
+    KnowledgeQuery,
+    KnowledgeQueryResult,
+    KnowledgeUpdateResult,
+)
 
 __all__ = [
     # configuration
@@ -171,6 +183,17 @@ __all__ = [
     "WorkspaceGet",
     "WorkspaceMessageSearchOptions",
     "WorkspaceUpdate",
+    # knowledge
+    "KnowledgeCreateResult",
+    "KnowledgeEntry",
+    "KnowledgeEntryCreate",
+    "KnowledgeEntryResult",
+    "KnowledgeEntryUpdate",
+    "KnowledgeHit",
+    "KnowledgePage",
+    "KnowledgeQuery",
+    "KnowledgeQueryResult",
+    "KnowledgeUpdateResult",
     # internal
     "DeriverMetrics",
     "DocumentBase",
