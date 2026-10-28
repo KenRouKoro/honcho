@@ -1,0 +1,154 @@
+Honcho — FoxBot fork
+====================
+
+This repository is a modified version ("fork") of **Honcho**, the memory layer
+originally created by **Plastic Labs, Inc.**
+
+- Upstream project: <https://github.com/plastic-labs/honcho>
+- Fork point (upstream commit): `be54355545b64ddb10203829d323861f52423685`
+- This fork: <https://github.com/KenRouKoro/honcho>
+- Maintainer of this fork: koro (KenRouKoro)
+- License of this repository: GNU Affero General Public License v3.0 only
+  (`AGPL-3.0-only`), see [LICENSE](./LICENSE)
+
+## Attribution
+
+Honcho — including all code that was present upstream at the fork point named
+above — is Copyright (c) Plastic Labs, Inc. and is licensed under the GNU Affero
+General Public License, version 3. The full license text is in `LICENSE`.
+
+The upstream README, badges, documentation and service references are retained
+as history and documentation of the original project. This fork is **not**
+affiliated with, endorsed by, or supported by Plastic Labs; do not report issues
+of this fork upstream. Links to the managed service (`api.honcho.dev`) and to
+the upstream documentation describe the original project, not this fork.
+
+## Modifications
+
+All changes made in this fork relative to the fork point above are
+Copyright (c) 2026 koro and are likewise licensed under `AGPL-3.0-only`, as
+required by the upstream license. Section 5(a) of the AGPL asks modified files
+to carry prominent notices stating that they were changed and the date. Because
+this repository is entirely derived from Honcho, every modified or added file is
+listed below with its last-modification date, which records the changes for the
+whole repository in one place.
+
+Functional summary of the changes:
+
+- **Identity and display names** — observe peers as `display name (stable id)`
+  built from QQ group cards stored in `session_peers`, with a per-session
+  roster, name history (曾用名), duplicate-name disambiguation, roster staleness
+  bounds, first-description sampling over full history, and a contradiction
+  write path in the deriver.
+- **Session profiles and representation** — session-level venue description plus
+  zero-LLM member statistics, long-term impression compression (plan B of
+  §18/§19), "today is …" and fixed-facts sections, compact timestamp rendering
+  with cross-session provenance.
+- **Dreamer** — per-session dream windows, off-peak (谷时) scheduling with
+  jitter, injection of "now" into dreamer prompts, profile refresh tests.
+- **Deriver** — runner/consumer split, contradiction write path, prompt updates.
+- **Knowledge Entries API (new)** — workspace-scoped explicit knowledge storage
+  with a pgvector HNSW index, idempotent create, semantic query, and route-level
+  tests (`POST/GET/PATCH/DELETE /v3/workspaces/{workspace_id}/knowledge`).
+- **Operations** — single-process Windows-compatible entry point (`start.ps1`),
+  explicit `SelectorEventLoop`, telemetry/metrics adjustments, local
+  configuration template (`.env.template`).
+- **Privacy** — real chat identifiers that had been used as examples were
+  replaced with placeholder values (`123456789012`) in this fork's history and
+  source files.
+- Removed an internal development task list (`foxbot-dream-sweep-task.md`) that
+  never existed upstream.
+
+## Sub-packages and their own licenses
+
+The upstream monorepo contains sub-packages whose licenses differ from the
+AGPL-3.0 server. They are retained unchanged in this fork, and their own
+licenses continue to apply to them only:
+
+- `sdks/python/pyproject.toml` — Apache-2.0
+- `sdks/typescript/package.json` — Apache-2.0
+- `honcho-cli/pyproject.toml` — MIT
+
+## Files changed in this fork (AGPL-3.0 §5(a))
+
+| File | Change | Last modified |
+| --- | --- | --- |
+| `.env.template` | modified | 2026-10-10 |
+| `CHANGELOG.md` | modified | 2026-10-09 |
+| `README.md` | modified | 2026-10-09 |
+| `docs/v3/contributing/self-hosting.mdx` | modified | 2026-10-09 |
+| `migrations/versions/c8b2f4a1d9e3_add_knowledge_entries.py` | new | 2026-10-28 |
+| `pyproject.toml` | modified | 2026-09-07 |
+| `src/config.py` | modified | 2026-10-10 |
+| `src/crud/__init__.py` | modified | 2026-10-28 |
+| `src/crud/display_name.py` | new | 2026-10-10 |
+| `src/crud/knowledge.py` | new | 2026-10-28 |
+| `src/crud/peer_card.py` | modified | 2026-10-09 |
+| `src/crud/representation.py` | modified | 2026-10-09 |
+| `src/crud/session_profile.py` | new | 2026-10-09 |
+| `src/crud/session_stats.py` | new | 2026-10-10 |
+| `src/deriver/__main__.py` | modified | 2026-09-07 |
+| `src/deriver/consumer.py` | modified | 2026-10-09 |
+| `src/deriver/deriver.py` | modified | 2026-10-10 |
+| `src/deriver/prompts.py` | modified | 2026-10-10 |
+| `src/deriver/queue_manager.py` | modified | 2026-10-09 |
+| `src/deriver/runner.py` | new | 2026-10-09 |
+| `src/dialectic/core.py` | modified | 2026-10-09 |
+| `src/dialectic/prompts.py` | modified | 2026-10-09 |
+| `src/dialectic/workspace.py` | modified | 2026-10-09 |
+| `src/dreamer/dream_scheduler.py` | modified | 2026-10-10 |
+| `src/dreamer/orchestrator.py` | modified | 2026-10-09 |
+| `src/dreamer/profile.py` | new | 2026-10-09 |
+| `src/dreamer/session_profile.py` | new | 2026-10-10 |
+| `src/dreamer/specialists.py` | modified | 2026-10-10 |
+| `src/exceptions.py` | modified | 2026-10-28 |
+| `src/loop.py` | new | 2026-10-09 |
+| `src/main.py` | modified | 2026-10-28 |
+| `src/models.py` | modified | 2026-10-28 |
+| `src/routers/knowledge.py` | new | 2026-10-28 |
+| `src/routers/sessions.py` | modified | 2026-10-09 |
+| `src/run.py` | new | 2026-10-09 |
+| `src/schemas/__init__.py` | modified | 2026-10-28 |
+| `src/schemas/api.py` | modified | 2026-10-10 |
+| `src/schemas/internal.py` | modified | 2026-10-09 |
+| `src/schemas/knowledge.py` | new | 2026-10-28 |
+| `src/telemetry/events/api.py` | modified | 2026-10-09 |
+| `src/telemetry/events/llm.py` | modified | 2026-10-28 |
+| `src/telemetry/metrics_collector.py` | modified | 2026-10-09 |
+| `src/telemetry/reasoning_traces.py` | modified | 2026-09-07 |
+| `src/utils/agent_tools.py` | modified | 2026-10-10 |
+| `src/utils/representation.py` | modified | 2026-10-09 |
+| `src/utils/summarizer.py` | modified | 2026-10-09 |
+| `start.ps1` | new | 2026-10-09 |
+| `tests/conftest.py` | modified | 2026-10-09 |
+| `tests/crud/test_knowledge.py` | new | 2026-10-28 |
+| `tests/deriver/test_display_names.py` | new | 2026-10-10 |
+| `tests/dreamer/test_card_refresh.py` | modified | 2026-10-10 |
+| `tests/dreamer/test_dream_scheduler.py` | modified | 2026-10-10 |
+| `tests/dreamer/test_dreamer_integration.py` | modified | 2026-10-09 |
+| `tests/dreamer/test_model_config_usage.py` | modified | 2026-10-09 |
+| `tests/dreamer/test_profile_compression.py` | new | 2026-10-09 |
+| `tests/dreamer/test_session_profile.py` | new | 2026-10-10 |
+| `tests/llm/test_agent_tool_schemas.py` | modified | 2026-10-10 |
+| `tests/llm/test_model_config.py` | modified | 2026-10-09 |
+| `tests/routes/test_knowledge.py` | new | 2026-10-28 |
+| `tests/routes/test_session_context_profile.py` | new | 2026-10-09 |
+| `tests/test_dialectic_prompts.py` | modified | 2026-10-09 |
+| `tests/unified/test_schema.py` | modified | 2026-10-09 |
+| `tests/utils/test_agent_tools.py` | modified | 2026-10-10 |
+| `tests/utils/test_representation_rendering.py` | new | 2026-10-09 |
+| `uv.lock` | modified | 2026-09-07 |
+
+## Corresponding source (AGPL-3.0 §13)
+
+The complete corresponding source of this fork is published at
+<https://github.com/KenRouKoro/honcho>. If you interact with a modified version
+of this software over a network, that repository is where the source can be
+obtained.
+
+## No warranty
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License in `LICENSE` for
+more details.

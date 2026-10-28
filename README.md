@@ -8,6 +8,11 @@
 
 ---
 
+> [!IMPORTANT]
+> **This is a non-official fork of [Honcho](https://github.com/plastic-labs/honcho), modified for the [FoxBot](https://github.com/KenRouKoro) project by [KenRouKoro](https://github.com/KenRouKoro).**
+> It is **not** affiliated with, endorsed by, or supported by Plastic Labs. The badges, documentation links and managed-service references below describe the *original* project, not this fork.
+> Attribution, the list of changes and licensing: [NOTICE](./NOTICE). Source of this fork: <https://github.com/KenRouKoro/honcho>.
+
 ![Static Badge](https://img.shields.io/badge/Server-3.1.1-blue)
 [![PyPI version](https://img.shields.io/pypi/v/honcho-ai.svg)](https://pypi.org/project/honcho-ai/)
 [![NPM version](https://img.shields.io/npm/v/@honcho-ai/sdk.svg)](https://npmjs.org/package/@honcho-ai/sdk)
@@ -726,6 +731,37 @@ We welcome contributions to Honcho. One thing to know before you start: **pull r
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full process, an architecture walkthrough, and a map of where to change what. For vulnerabilities, see [SECURITY.md](./SECURITY.md) — note that Honcho does not operate a bug bounty.
 
+## About This Fork
+
+This repository is a modified AGPL-3.0 fork of Honcho maintained for the FoxBot
+project. The upstream [README](https://github.com/plastic-labs/honcho) still
+describes the original project and its managed service; this fork is a
+self-hosted fork that is **not** affiliated with Plastic Labs.
+
+Relative to the fork point (`be54355545b64ddb10203829d323861f52423685`), it adds:
+
+- **Identity** — peers are observed as `display name (stable id)` built from QQ
+  group cards (`session_peers`), with a per-session roster, name history,
+  duplicate-name disambiguation, roster staleness bounds and a contradiction
+  write path.
+- **Session profiles** — venue description plus zero-LLM member statistics,
+  long-term impression compression, "today is …" / fixed-facts sections, compact
+  timestamps with cross-session provenance.
+- **Dreamer** — per-session dream windows, off-peak scheduling with jitter,
+  "now" injection into dreamer prompts.
+- **Knowledge Entries API** — workspace-scoped explicit knowledge storage with
+  pgvector HNSW index, idempotent create and semantic query, under
+  `/v3/workspaces/{workspace_id}/knowledge`.
+- **Operations** — Windows-compatible single-process entry point, explicit
+  `SelectorEventLoop`, local configuration template.
+
+See [NOTICE](./NOTICE) for attribution, the full §5(a) modification table and
+the sub-package licenses (they keep their own Apache-2.0 / MIT terms).
+
 ## License
 
 Honcho is licensed under the AGPL-3.0 License. Learn more at the [License file](./LICENSE).
+
+This fork, including all modifications listed in [NOTICE](./NOTICE), is licensed
+under **AGPL-3.0-only** as well; the corresponding source is published at
+<https://github.com/KenRouKoro/honcho>.
